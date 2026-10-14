@@ -163,33 +163,81 @@ def _resolve_archive(image_path: Path, dataset_root: Path) -> Path:
     raise FileNotFoundError(f"episode archive not found: {image_path}")
 
 
+def _suffixed_episode_id(
+    episode_id: str, binary_data_id: str, archive_sha256: str, taken: set[str]
+) -> str:
+    """Suffix a colliding episode_id from the upload's identity, stable across reruns."""
+    source = binary_data_id or archive_sha256
+    digest = hashlib.sha256(source.encode()).hexdigest()
+    # Lengthen the suffix only if a shorter one is already taken.
+    for length in range(8, len(digest) + 1, 4):
+        candidate = f"{episode_id}-{digest[:length]}"
+        if candidate not in taken:
+            return candidate
+    raise ValueError(f"cannot derive a unique episode_id for {episode_id!r}")
+
+
 def ingest_episodes(dataset_file: Path, episodes_root: Path) -> dict[str, object]:
-    """Unpack every episode zip listed in the Viam JSONL into *episodes_root*/<episode_id>/."""
+    """Unpack every episode zip listed in the Viam JSONL into *episodes_root*/<episode_id>/.
+
+    Separate capture runs can reuse episode IDs. An archive identical to one
+    already listed is the same episode uploaded twice and is skipped. Every
+    remaining episode whose ID collides is renamed (folder and manifest) with a
+    suffix derived from its own binary_data_id, so IDs do not depend on the
+    order of the JSONL; episodes without collisions keep their IDs.
+    """
     episodes_root.mkdir(parents=True)
     dataset_root = dataset_file.parent
-    records: list[dict[str, str]] = []
-    seen: dict[str, str] = {}
-    with dataset_file.open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, 1):
-            line = line.strip()
-            if not line:
-                continue
-            entry = json.loads(line)
-            image_path = entry.get("image_path")
-            if not isinstance(image_path, str) or not image_path:
-                raise ValueError(f"{dataset_file}:{line_number}: missing image_path")
-            archive = _resolve_archive(Path(image_path), dataset_root)
-            # Viam's cloud JSONL strips the upload's file_extension, so sniff rather than trust the name.
-            if not zipfile.is_zipfile(archive):
-                print(f"skipping non-episode file {archive.name}", flush=True)
-                continue
-            with tempfile.TemporaryDirectory(dir=episodes_root.parent) as scratch:
-                tops = _safe_extract(archive, Path(scratch))
+    staged: list[dict] = []
+    by_sha256: dict[str, dict] = {}  # archive sha256 -> staged item
+    # IDs are assigned only after every archive is read, so episodes stay
+    # staged until the second pass moves them into place.
+    with tempfile.TemporaryDirectory(dir=episodes_root.parent) as scratch:
+        staging = Path(scratch)
+        # Pass 1: unpack and validate each archive, skipping identical copies.
+        with dataset_file.open(encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                image_path = entry.get("image_path")
+                if not isinstance(image_path, str) or not image_path:
+                    raise ValueError(f"{dataset_file}:{line_number}: missing image_path")
+                archive = _resolve_archive(Path(image_path), dataset_root)
+                # Viam's cloud JSONL strips the upload's file_extension, so sniff rather than trust the name.
+                if not zipfile.is_zipfile(archive):
+                    print(f"skipping non-episode file {archive.name}", flush=True)
+                    continue
+                binary_data_id = str(entry.get("binary_data_id", ""))
+                label = f"{archive.name} ({binary_data_id})" if binary_data_id else archive.name
+                archive_sha256 = _sha256(archive)
+                kept = by_sha256.get(archive_sha256)
+                if kept is not None:
+                    # Keep the copy with the smallest binary_data_id so the
+                    # surviving upload, and any suffix derived from it, does
+                    # not depend on JSONL order.
+                    if binary_data_id < kept["binary_data_id"]:
+                        skipped = kept["label"]
+                        kept.update(
+                            label=label,
+                            file_name=archive.name,
+                            binary_data_id=binary_data_id,
+                        )
+                    else:
+                        skipped = label
+                    print(
+                        f"skipping {skipped}: identical to {kept['label']}",
+                        flush=True,
+                    )
+                    continue
+                destination = staging / str(len(staged))
+                tops = _safe_extract(archive, destination)
                 if len(tops) != 1:
                     raise ValueError(
                         f"{archive.name}: expected one episode directory, found {tops}"
                     )
-                extracted = Path(scratch) / tops[0]
+                extracted = destination / tops[0]
                 manifest_path = extracted / "manifest.json"
                 if not manifest_path.is_file():
                     raise ValueError(
@@ -203,20 +251,50 @@ def ingest_episodes(dataset_file: Path, episodes_root: Path) -> dict[str, object
                     raise ValueError(
                         f"{archive.name}: episode_id {episode_id!r} is not a plain name"
                     )
-                if episode_id in seen:
-                    raise ValueError(
-                        f"{archive.name}: duplicate episode_id {episode_id!r} (also in {seen[episode_id]})"
-                    )
-                seen[episode_id] = archive.name
-                shutil.move(str(extracted), str(episodes_root / episode_id))
-            records.append(
-                {
+                item = {
+                    "extracted": extracted,
+                    "manifest": manifest,
                     "episode_id": episode_id,
+                    "label": label,
                     "file_name": archive.name,
-                    "binary_data_id": str(entry.get("binary_data_id", "")),
-                    "sha256": _sha256(archive),
+                    "binary_data_id": binary_data_id,
+                    "sha256": archive_sha256,
                 }
-            )
+                staged.append(item)
+                by_sha256[archive_sha256] = item
+
+        # Pass 2: suffix every member of a colliding group, then move into place.
+        counts: dict[str, int] = {}
+        for item in staged:
+            counts[item["episode_id"]] = counts.get(item["episode_id"], 0) + 1
+        taken = {item["episode_id"] for item in staged}
+        records: list[dict[str, str]] = []
+        for item in staged:
+            source_episode_id = episode_id = item["episode_id"]
+            if counts[source_episode_id] > 1:
+                episode_id = _suffixed_episode_id(
+                    source_episode_id, item["binary_data_id"], item["sha256"], taken
+                )
+                taken.add(episode_id)
+                item["manifest"]["episode_id"] = episode_id
+                (item["extracted"] / "manifest.json").write_text(
+                    json.dumps(item["manifest"], indent=2) + "\n", encoding="utf-8"
+                )
+                print(
+                    f"renamed duplicate episode_id {source_episode_id!r} in "
+                    f"{item['label']} to {episode_id!r}",
+                    flush=True,
+                )
+            shutil.move(str(item["extracted"]), str(episodes_root / episode_id))
+            record = {
+                "episode_id": episode_id,
+                "file_name": item["file_name"],
+                "binary_data_id": item["binary_data_id"],
+                "sha256": item["sha256"],
+            }
+            if episode_id != source_episode_id:
+                record["source_episode_id"] = source_episode_id
+            records.append(record)
     if not records:
         raise ValueError(f"{dataset_file} lists no episode zips")
     records.sort(key=lambda item: item["episode_id"])

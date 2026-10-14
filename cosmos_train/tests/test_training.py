@@ -76,16 +76,91 @@ def test_ingest_unpacks_by_manifest_episode_id_and_hashes_content(
     assert again["content_sha256"] == result["content_sha256"]
 
 
-def test_ingest_rejects_duplicates_and_unsafe_members(tmp_path: Path) -> None:
+def test_ingest_renames_every_colliding_episode_id(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    _episode_zip(data / "a.zip", "000001")
+    # A second capture run restarts numbering, so its episode reuses the ID.
+    _episode_zip(data / "dup.zip", "000001", member_prefix="other")
+    _episode_zip(data / "c.zip", "000002")
+    dataset_file = tmp_path / "dataset.jsonl"
+    _jsonl(dataset_file, [str(data / n) for n in ("a.zip", "dup.zip", "c.zip")])
+
+    result = ingest_episodes(dataset_file, tmp_path / "episodes")
+
+    by_file = {r["file_name"]: r for r in result["episodes"]}
+    assert by_file["c.zip"]["episode_id"] == "000002"
+    assert "source_episode_id" not in by_file["c.zip"]
+    renamed = [by_file[n]["episode_id"] for n in ("a.zip", "dup.zip")]
+    assert len(set(renamed)) == 2
+    for name, episode_id in zip(("a.zip", "dup.zip"), renamed):
+        assert episode_id.startswith("000001-") and len(episode_id) == len("000001-") + 8
+        assert by_file[name]["source_episode_id"] == "000001"
+        manifest = json.loads(
+            (tmp_path / "episodes" / episode_id / "manifest.json").read_text()
+        )
+        assert manifest["episode_id"] == episode_id
+    assert sorted(p.name for p in (tmp_path / "episodes").iterdir()) == sorted(
+        [*renamed, "000002"]
+    )
+
+
+def test_ingest_ids_do_not_depend_on_jsonl_order(tmp_path: Path) -> None:
     data = tmp_path / "data"
     data.mkdir()
     _episode_zip(data / "a.zip", "000001")
     _episode_zip(data / "dup.zip", "000001", member_prefix="other")
-    dataset_file = tmp_path / "dataset.jsonl"
-    _jsonl(dataset_file, [str(data / "a.zip"), str(data / "dup.zip")])
-    with pytest.raises(ValueError, match="duplicate episode_id"):
-        ingest_episodes(dataset_file, tmp_path / "episodes")
+    forward = tmp_path / "forward.jsonl"
+    backward = tmp_path / "backward.jsonl"
+    forward.write_text(
+        json.dumps({"image_path": str(data / "a.zip"), "binary_data_id": "org/loc/a"})
+        + "\n"
+        + json.dumps({"image_path": str(data / "dup.zip"), "binary_data_id": "org/loc/b"})
+    )
+    backward.write_text("\n".join(reversed(forward.read_text().splitlines())))
 
+    first = ingest_episodes(forward, tmp_path / "episodes")
+    second = ingest_episodes(backward, tmp_path / "episodes2")
+
+    def ids(result):
+        return {r["binary_data_id"]: r["episode_id"] for r in result["episodes"]}
+
+    assert ids(first) == ids(second)
+    assert first["content_sha256"] == second["content_sha256"]
+
+
+def test_ingest_skips_identical_archives(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    _episode_zip(data / "a.zip", "000001")
+    _episode_zip(data / "b.zip", "000001", member_prefix="other")
+    (data / "a-again.zip").write_bytes((data / "a.zip").read_bytes())
+    (data / "b-again.zip").write_bytes((data / "b.zip").read_bytes())
+    dataset_file = tmp_path / "dataset.jsonl"
+    _jsonl(
+        dataset_file,
+        [str(data / name) for name in ("a.zip", "b.zip", "a-again.zip", "b-again.zip")],
+    )
+
+    result = ingest_episodes(dataset_file, tmp_path / "episodes")
+
+    assert sorted(r["file_name"] for r in result["episodes"]) == ["a.zip", "b.zip"]
+    assert len(list((tmp_path / "episodes").iterdir())) == 2
+
+    # The surviving copy is the smallest binary_data_id, whatever the order.
+    backward = tmp_path / "backward.jsonl"
+    backward.write_text(
+        "\n".join(reversed(dataset_file.read_text().splitlines()))
+    )
+    again = ingest_episodes(backward, tmp_path / "episodes2")
+    assert again["episodes"] == result["episodes"]
+    assert again["content_sha256"] == result["content_sha256"]
+
+
+def test_ingest_rejects_unsafe_members(tmp_path: Path) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    dataset_file = tmp_path / "dataset.jsonl"
     evil = data / "evil.zip"
     with zipfile.ZipFile(evil, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("../escape/manifest.json", b"{}")
