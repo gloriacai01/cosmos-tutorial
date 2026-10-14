@@ -108,10 +108,10 @@ def test_parse_args_defaults_warmup_and_outcomes() -> None:
     assert args.stage == "train"
     assert args.save_iter is None
     assert args.num_workers == 4
+    assert args.samples_per_gpu == 8
     assert args.grad_accum == 2
     assert args.train_lr == pytest.approx(2.5e-5)
     assert args.train_lr_end_factor == pytest.approx(0.2)
-    assert args.compile_vae is True
 
 
 def test_parse_args_accepts_training_tunables() -> None:
@@ -125,7 +125,6 @@ def test_parse_args_accepts_training_tunables() -> None:
             "--grad_accum=2",
             "--train_lr=1e-4",
             "--train_lr_end_factor=0.1",
-            "--compile_vae=true",
         ]
     )
     assert args.save_iter == 25
@@ -133,32 +132,6 @@ def test_parse_args_accepts_training_tunables() -> None:
     assert args.grad_accum == 2
     assert args.train_lr == pytest.approx(1e-4)
     assert args.train_lr_end_factor == pytest.approx(0.1)
-    assert args.compile_vae is True
-
-
-@pytest.mark.parametrize("value", ["false", "0", "no", "off", "False"])
-def test_parse_args_compile_vae_can_be_disabled(value: str) -> None:
-    args = parse_args(
-        [
-            "--dataset_file=d.jsonl",
-            "--model_output_directory=out",
-            "--max_iter=100",
-            f"--compile_vae={value}",
-        ]
-    )
-    assert args.compile_vae is False
-
-
-def test_parse_args_compile_vae_rejects_garbage() -> None:
-    with pytest.raises(SystemExit):
-        parse_args(
-            [
-                "--dataset_file=d.jsonl",
-                "--model_output_directory=out",
-                "--max_iter=100",
-                "--compile_vae=sure",
-            ]
-        )
 
 
 @pytest.mark.parametrize(
@@ -166,6 +139,7 @@ def test_parse_args_compile_vae_rejects_garbage() -> None:
     [
         (["--save_iter=0"], "save_iter"),
         (["--num_workers=0"], "num_workers"),
+        (["--samples_per_gpu=0"], "samples_per_gpu"),
         (["--grad_accum=0"], "grad_accum"),
         (["--train_lr=0"], "train_lr"),
         (["--train_lr_end_factor=1.5"], "train_lr_end_factor"),
@@ -190,17 +164,12 @@ def test_train_command_defaults(tmp_path: Path) -> None:
     assert "trainer.max_iter=100" in cmd
     assert "checkpoint.save_iter=100" in cmd
     assert "dataloader_train.dataloader.num_workers=4" in cmd
+    assert "dataloader_train.max_samples_per_batch=8" in cmd
     assert "dataloader_train.dataloader.batch_size=1" in cmd
     assert "trainer.grad_accum_iter=2" in cmd
     assert "optimizer.lr=2.5e-05" in cmd
     assert "scheduler.f_min=[0.2]" in cmd
-    assert "trainer.callbacks.compile_tokenizer.enabled=True" in cmd
     assert "dataloader_train.dataloader.datasets.droid.dataset.fps=15.0" in cmd
-
-
-def test_train_command_rejects_non_positive_fps(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="fps"):
-        train_command(tmp_path, gpus=1, max_iter=10, warmup_steps=1, fps=0)
 
 
 def test_train_command_opt_out_overrides(tmp_path: Path) -> None:
@@ -213,12 +182,10 @@ def test_train_command_opt_out_overrides(tmp_path: Path) -> None:
         grad_accum=None,
         train_lr=None,
         train_lr_end_factor=None,
-        compile_vae=False,
     )
     assert not any(flag.startswith("trainer.grad_accum_iter=") for flag in cmd)
     assert not any(flag.startswith("optimizer.lr=") for flag in cmd)
     assert not any(flag.startswith("scheduler.f_min=") for flag in cmd)
-    assert not any("compile_tokenizer" in flag for flag in cmd)
 
 
 def test_train_command_appends_overrides_when_supplied(tmp_path: Path) -> None:
@@ -233,15 +200,12 @@ def test_train_command_appends_overrides_when_supplied(tmp_path: Path) -> None:
         grad_accum=2,
         train_lr=1e-4,
         train_lr_end_factor=0.1,
-        compile_vae=True,
     )
     assert "checkpoint.save_iter=50" in cmd
     assert "dataloader_train.dataloader.num_workers=8" in cmd
     assert "trainer.grad_accum_iter=2" in cmd
     assert "optimizer.lr=0.0001" in cmd
     assert "scheduler.f_min=[0.1]" in cmd
-    assert "trainer.callbacks.compile_tokenizer.enabled=True" in cmd
-    assert "trainer.callbacks.compile_tokenizer.warmup_resolutions=['480']" in cmd
 
 
 def test_training_environment_sets_tokenizer_thread_limits(tmp_path: Path) -> None:
@@ -340,14 +304,3 @@ def test_patch_framework_records_the_dataset_fps_in_the_export(tmp_path: Path) -
     text = exporter.read_text()
     assert text.count('"conditioning_fps": 15.0') == 1
     assert "_build_edge_policy_metadata" not in text
-
-
-def test_patch_framework_replaces_an_earlier_runs_fps(tmp_path: Path) -> None:
-    exporter = _fake_framework(tmp_path)
-    patch_framework_for_edge(tmp_path, fps=20.0)
-
-    patch_framework_for_edge(tmp_path, fps=15.0)
-
-    text = exporter.read_text()
-    assert '"conditioning_fps": 15.0' in text
-    assert '"conditioning_fps": 20.0' not in text

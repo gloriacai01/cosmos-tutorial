@@ -26,18 +26,6 @@ from cosmos_train.prepare_droid import DROID_ROOT_NAME, prepare
 
 STAGES = ("prepare", "train")
 
-_BOOL_TRUE = {"1", "true", "yes", "on"}
-_BOOL_FALSE = {"0", "false", "no", "off"}
-
-
-def _bool_arg(value: str) -> bool:
-    normalized = value.strip().lower()
-    if normalized in _BOOL_TRUE:
-        return True
-    if normalized in _BOOL_FALSE:
-        return False
-    raise argparse.ArgumentTypeError(f"invalid bool: {value!r}")
-
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -73,6 +61,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="dataloader workers per GPU",
     )
     parser.add_argument(
+        "--samples_per_gpu",
+        type=int,
+        default=8,
+        help="samples per GPU per step; lower it (and raise grad_accum) if GPU memory runs out",
+    )
+    parser.add_argument(
         "--grad_accum",
         type=int,
         default=2,
@@ -89,12 +83,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=float,
         default=0.2,
         help="final learning rate as a fraction of the peak (0-1)",
-    )
-    parser.add_argument(
-        "--compile_vae",
-        type=_bool_arg,
-        default=True,
-        help="compile the Wan VAE encoder; NVIDIA's DROID recipe does",
     )
     parser.add_argument(
         "--dataset_id", default="", help="Viam dataset ID, recorded in provenance"
@@ -119,6 +107,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--save_iter must be positive")
     if args.num_workers <= 0:
         parser.error("--num_workers must be positive")
+    if args.samples_per_gpu <= 0:
+        parser.error("--samples_per_gpu must be positive")
     if args.grad_accum is not None and args.grad_accum <= 0:
         parser.error("--grad_accum must be positive")
     if args.train_lr is not None and args.train_lr <= 0:
@@ -344,10 +334,10 @@ def train_and_export(
         fps=fps,
         save_iter=args.save_iter,
         num_workers=args.num_workers,
+        samples_per_gpu=args.samples_per_gpu,
         grad_accum=args.grad_accum,
         train_lr=args.train_lr,
         train_lr_end_factor=args.train_lr_end_factor,
-        compile_vae=args.compile_vae,
     )
     print("+", " ".join(command), flush=True)
     subprocess.run(command, cwd=framework_root, env=env, check=True)

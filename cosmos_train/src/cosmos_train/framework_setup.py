@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -107,22 +106,10 @@ def patch_framework_for_edge(root: Path, *, fps: float) -> None:
     )
 """
     text = exporter.read_text()
-    # A checkout patched by an earlier run may carry another dataset's rate.
-    patched = re.search(
-        r"    edge_policy_metadata = \(\n        \{.*\}\n        if is_edge", text
-    )
     if replacement in text:
         pass
     elif needle in text:
         exporter.write_text(text.replace(needle, replacement, 1))
-    elif patched:
-        exporter.write_text(
-            text.replace(
-                patched.group(0),
-                f"    edge_policy_metadata = (\n        {json.dumps(metadata)}\n        if is_edge",
-                1,
-            )
-        )
     else:
         raise RuntimeError("pinned Edge policy exporter changed")
 
@@ -249,15 +236,13 @@ def train_command(
     fps: float,
     save_iter: int | None = None,
     num_workers: int = 4,
+    samples_per_gpu: int = 8,
     grad_accum: int | None = 2,
     train_lr: float | None = 2.5e-5,
     train_lr_end_factor: float | None = 0.2,
-    compile_vae: bool = True,
 ) -> list[str]:
     if max_iter <= 0 or warmup_steps <= 0:
         raise ValueError("max_iter and warmup_steps must be positive")
-    if fps <= 0:
-        raise ValueError("fps must be positive")
     if num_workers <= 0:
         raise ValueError("num_workers must be positive")
     if save_iter is not None and save_iter <= 0:
@@ -281,6 +266,7 @@ def train_command(
         f"scheduler.cycle_lengths=[{max_iter}]",
         f"scheduler.warm_up_steps=[{warmup_steps}]",
         f"dataloader_train.dataloader.num_workers={num_workers}",
+        f"dataloader_train.max_samples_per_batch={samples_per_gpu}",
         # batch_size=1: each worker hands over one sample at a time, so the packer fills each
         # batch from several workers (episodes) instead of consecutive windows of one episode.
         "dataloader_train.dataloader.batch_size=1",
@@ -297,13 +283,6 @@ def train_command(
         args.append(f"optimizer.lr={train_lr}")
     if train_lr_end_factor is not None:
         args.append(f"scheduler.f_min=[{train_lr_end_factor}]")
-    if compile_vae:
-        args.extend(
-            [
-                "trainer.callbacks.compile_tokenizer.enabled=True",
-                "trainer.callbacks.compile_tokenizer.warmup_resolutions=['480']",
-            ]
-        )
     return args
 
 
