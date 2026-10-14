@@ -74,11 +74,14 @@ plus git/ffmpeg/uv with the pinned cosmos-framework checkout and its venv baked 
 `pytorch:26.06` container does not work: it ships no FFmpeg libraries, so torchcodec
 cannot load in the dataloader.
 
-Local check without a GPU (`viam training-script test-local` stat-checks for a
-`setup.py`, so stage the package in a directory with an empty one):
+Local check without a GPU. The `prepare` stage unpacks the dataset zips,
+runs `convert_native` → `prepare_droid` → `policy_contract` to check the shape of the data.
 
 ```sh
 viam dataset export --destination ds-export --dataset-id <dataset-id>
-PYTHONPATH=. uv run python -m model.training --dataset_file ds-export/dataset.jsonl \
-    --model_output_directory out --stage prepare
+uv sync
+uv run python -m model.training \
+    --dataset_file ds-export/dataset.jsonl \
+    --model_output_directory out \
+    --stage prepare
 ```
