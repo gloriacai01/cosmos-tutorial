@@ -11,7 +11,9 @@ plane at `support_z_m`.
 Layout: layer `i` holds `slots_per_layer` blocks side by side. Even layers lay
 their long axis along the tower's local X, odd layers along local Y, so each
 layer crosses the one below at 90 degrees. Placement `k` fills layer
-`k // slots_per_layer`, slot `slot_order[k % slots_per_layer]`. Which prop fills
+`k // slots_per_layer`, in the layer's fill order (`layer_slot_order`): by
+default the middle slot first, then the side nearer the arm, then the far
+side. Which prop fills
 which placement is shuffled per seed (`prop_order`), so each block's colour
 lands somewhere different in every tower.
 
@@ -98,9 +100,13 @@ class TowerConfig:
     layers: int = 12
     slots_per_layer: int = 3
     # Fill order within a layer, as slot indices (0 = negative side of the
-    # layer, slots_per_layer - 1 = positive side). Fixed so identical images
-    # never get conflicting labels.
-    slot_order: tuple[int, ...] = (0, 1, 2)
+    # layer, slots_per_layer - 1 = positive side). None: middle first, then
+    # the side nearer the arm, then the far side, worked out per layer
+    # direction from `arm_xy_m`. Fixed per tower so identical images never
+    # get conflicting labels.
+    slot_order: tuple[int, ...] | None = None
+    # The arm base in world XY, for the default fill order.
+    arm_xy_m: tuple[float, float] = (0.0, 0.0)
     block_length_m: float = BLOCK_LENGTH_M
     block_width_m: float = BLOCK_WIDTH_M
     block_thickness_m: float = BLOCK_THICKNESS_M
@@ -115,7 +121,9 @@ class TowerConfig:
     def __post_init__(self) -> None:
         if self.layers < 1 or self.slots_per_layer < 1:
             raise ValueError("tower needs at least one layer and one slot")
-        if sorted(self.slot_order) != list(range(self.slots_per_layer)):
+        if self.slot_order is not None and sorted(self.slot_order) != list(
+            range(self.slots_per_layer)
+        ):
             raise ValueError("slot_order must be a permutation of the slot indices")
         if self.slot_gap_m < 0.0:
             raise ValueError("slot_gap_m must be non-negative")
@@ -278,7 +286,24 @@ def slot_ref(config: TowerConfig, placement_index: int) -> SlotRef:
     if not 0 <= placement_index < config.block_count:
         raise ValueError(f"placement index {placement_index} outside the tower")
     layer, position_in_layer = divmod(placement_index, config.slots_per_layer)
-    return SlotRef(placement_index, layer, config.slot_order[position_in_layer])
+    return SlotRef(placement_index, layer, layer_slot_order(config, layer)[position_in_layer])
+
+
+def layer_slot_order(config: TowerConfig, layer: int) -> tuple[int, ...]:
+    """The order a layer's slots are filled in: `slot_order` if set, else
+    from the middle outward, the side nearer the arm before the far side.
+
+    Even and odd layers run in different directions, so which side is nearer
+    the arm can differ between them; ties go to the lower slot index."""
+    if config.slot_order is not None:
+        return config.slot_order
+    centre = (config.slots_per_layer - 1) / 2.0
+
+    def key(slot: int) -> tuple[float, float, int]:
+        pose = nominal_slot_pose(config, SlotRef(0, layer, slot))
+        return (abs(slot - centre), math.dist(pose.position[:2], config.arm_xy_m), slot)
+
+    return tuple(sorted(range(config.slots_per_layer), key=key))
 
 
 def _rotate_xy(x: float, y: float, yaw_deg: float) -> tuple[float, float]:

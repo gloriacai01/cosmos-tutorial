@@ -26,14 +26,40 @@ def test_slot_ref_fills_layers_in_slot_order():
     ]
 
 
+def test_default_fill_order_is_middle_then_near_side_then_far_side():
+    # Default spot (0.30, 0.10), arm at the origin: slot 0 is nearer in both
+    # layer directions. With the tower on the other side of the arm, even
+    # layers' near side flips.
+    assert [jt.layer_slot_order(TOWER, layer) for layer in (0, 1)] == [(1, 0, 2), (1, 0, 2)]
+    other_side = jt.TowerConfig(base_xy_m=(0.30, -0.10))
+    assert [jt.layer_slot_order(other_side, layer) for layer in (0, 1)] == [(1, 2, 0), (1, 0, 2)]
+    for base, yaw, arm in [
+        ((0.30, 0.10), 0.0, (0.0, 0.0)),
+        ((0.30, -0.10), 0.0, (0.0, 0.0)),
+        ((0.25, 0.20), 35.0, (0.0, 0.0)),
+        ((0.30, 0.10), 0.0, (0.50, 0.40)),
+        ((-0.30, 0.10), 0.0, (0.0, 0.0)),
+    ]:
+        config = jt.TowerConfig(base_xy_m=base, base_yaw_deg=yaw, arm_xy_m=arm)
+        for layer in (0, 1, 4, 11):
+            refs = [jt.slot_ref(config, layer * 3 + i) for i in range(3)]
+            assert {r.layer for r in refs} == {layer}
+            assert refs[0].slot == 1
+            near, far = (
+                math.dist(jt.nominal_slot_pose(config, r).position[:2], arm) for r in refs[1:]
+            )
+            assert near < far, (base, yaw, arm, layer)
+
+
 def test_slot_order_must_be_a_permutation():
     with pytest.raises(ValueError):
         jt.TowerConfig(slot_order=(0, 0, 1))
 
 
 def test_layers_alternate_ninety_degrees_and_stack_by_thickness():
-    even = jt.nominal_slot_pose(TOWER, jt.slot_ref(TOWER, 1))
-    odd = jt.nominal_slot_pose(TOWER, jt.slot_ref(TOWER, 4))
+    # Each layer's first placement is its middle slot.
+    even = jt.nominal_slot_pose(TOWER, jt.slot_ref(TOWER, 0))
+    odd = jt.nominal_slot_pose(TOWER, jt.slot_ref(TOWER, 3))
     assert jt.yaw_error_deg(odd.yaw_deg, even.yaw_deg + 90.0) == pytest.approx(0.0)
     assert even.position[2] == pytest.approx(jt.BLOCK_THICKNESS_M / 2)
     assert odd.position[2] == pytest.approx(1.5 * jt.BLOCK_THICKNESS_M)
@@ -141,7 +167,8 @@ def test_next_block_and_slot_match_placed_count():
     assert list(spec.tower_poses) == order[:4]
     assert spec.next_block == order[4]
     assert spec.next_block not in spec.tower_poses
-    assert (spec.next_slot.layer, spec.next_slot.slot) == (1, 1)
+    # Layer 1's second block: the side nearer the arm (slot 0 at the default spot).
+    assert (spec.next_slot.layer, spec.next_slot.slot) == (1, 0)
 
 
 def test_set_d_misplaces_the_last_block_within_range():

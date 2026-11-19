@@ -909,6 +909,7 @@ async def _run(args: argparse.Namespace) -> int:
             xs, ys = zip(*supply_corners)
             tower = jt.TowerConfig(
                 base_xy_m=tower_xy, base_yaw_deg=args.tower_yaw_deg, layers=args.layers,
+                arm_xy_m=await arm_to_world_xy(machine, names.arm, 0.0, 0.0),
                 slot_gap_m=args.slot_gap_m, **jt.scaled_block_dims(args.block_scale),
             )
             supply = jt.SupplyConfig(
