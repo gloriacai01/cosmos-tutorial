@@ -110,6 +110,8 @@ RESET_SETTLE_SEC = 1.0
 RESET_STABLE_XY_M = 0.003
 RESET_STABLE_YAW_DEG = 2.0
 RESET_STABLE_Z_M = 0.004
+# A grasp counts if the block rose at least this far with the gripper.
+MIN_LIFT_TO_COUNT_AS_HELD_M = 0.02
 
 
 @dataclass(frozen=True)
@@ -323,7 +325,8 @@ class _Episode:
         self, block: jt.Pose, label: str, clear_z: float, lift_z: float
     ) -> bool:
         """Cross above the tower, descend onto the block, grab, and lift
-        straight up to `lift_z`. Returns whether the gripper holds the block."""
+        straight up to `lift_z`. Returns whether the gripper *reports* holding
+        the block; callers should check the block's measured height too."""
         x, y, z = block.position
         yaw = tool_yaw_deg(block.yaw_deg, self.grasp)
         grasp_z = z + self.grasp.grasp_z_offset_m
@@ -349,6 +352,7 @@ class _Episode:
         status = await self.gripper.is_holding_something()
         return bool(status.is_holding_something)
 
+
     async def adjust(
         self, block: str, target: jt.Pose, label: str, clear_z: float
     ) -> jt.Pose:
@@ -371,19 +375,21 @@ class _Episode:
             f"{label}-grasp", x, y, grasp_z, start_yaw,
             LINEAR_PICK_CONSTRAINTS, FINAL_DESCENT_MIN_DURATION_SEC,
         )
-        if await self.grab():
-            await self.go(
-                f"{label}-lift", x, y, lifted, start_yaw,
-                LINEAR_PICK_CONSTRAINTS, FINAL_DESCENT_MIN_DURATION_SEC,
-            )
-            await self.go(
-                f"{label}-shift", tx, ty, lifted, target_yaw,
-                LINEAR_PICK_CONSTRAINTS, FINAL_DESCENT_MIN_DURATION_SEC,
-            )
-            await self.go(
-                f"{label}-lower", tx, ty, grasp_z + self.grasp.release_clearance_m,
-                target_yaw, LINEAR_PICK_CONSTRAINTS, FINAL_DESCENT_MIN_DURATION_SEC,
-            )
+        # The gripper's firm-grasp flag can miss a held flat block, so carry
+        # on regardless; the block's measured pose afterwards is the truth.
+        await self.grab()
+        await self.go(
+            f"{label}-lift", x, y, lifted, start_yaw,
+            LINEAR_PICK_CONSTRAINTS, FINAL_DESCENT_MIN_DURATION_SEC,
+        )
+        await self.go(
+            f"{label}-shift", tx, ty, lifted, target_yaw,
+            LINEAR_PICK_CONSTRAINTS, FINAL_DESCENT_MIN_DURATION_SEC,
+        )
+        await self.go(
+            f"{label}-lower", tx, ty, grasp_z + self.grasp.release_clearance_m,
+            target_yaw, LINEAR_PICK_CONSTRAINTS, FINAL_DESCENT_MIN_DURATION_SEC,
+        )
         await self.open(f"{label}-release")
         await _wait_sim_duration(self.world, self.grasp.release_settle_sec)
         await self.go(
@@ -406,14 +412,17 @@ async def reset_tower(
         unused = [
             name
             for name in tower.block_names()
-            if name not in spec.tower_poses and name != spec.next_block
+            if name not in spec.tower_poses
+            and name != spec.next_block
+            and name not in spec.scattered_poses
         ]
         if unused:
             await world.do_command({"command": "park_props", "props": unused})
-        for name, pose in spec.tower_poses.items():
+        # tower_poses is in placement order; props are shuffled per seed.
+        for placement, (name, pose) in enumerate(spec.tower_poses.items()):
             if name == spec.misplaced_block and spec.misplaced_pose is not None:
                 pose = spec.misplaced_pose
-            layer = jt.slot_ref(tower, tower.block_names().index(name)).layer
+            layer = jt.slot_ref(tower, placement).layer
             lifted = jt.Pose(
                 (
                     pose.position[0],
@@ -424,6 +433,8 @@ async def reset_tower(
             )
             await world.do_command(lifted.as_prop_command(name))
         await world.do_command(spec.supply_pose.as_prop_command(spec.next_block))
+        for name, pose in spec.scattered_poses.items():
+            await world.do_command(pose.as_prop_command(name))
     finally:
         await world.do_command({"command": "play"})
     await _wait_sim_duration(world, RESET_SETTLE_SEC)
@@ -573,15 +584,19 @@ async def execute_place(
             before[spec.misplaced_block] = straightened
 
         await ep.mark(STAGE_PICK)
-        holding = await ep.pick(supply, "pick", clear_z, carry_estimate_z)
+        reported = await ep.pick(supply, "pick", clear_z, carry_estimate_z)
+        tcp_x, tcp_y, tcp_z, pick_yaw = await ep.tcp()
+        lifted = await ep.read_pose(spec.next_block)
+        # The sim's own block pose decides whether the grasp worked; the
+        # gripper's firm-grasp flag can miss a flat block it is holding.
+        holding = lifted.position[2] - supply.position[2] >= MIN_LIFT_TO_COUNT_AS_HELD_M
         result["holding_after_lift"] = holding
+        result["gripper_reported_holding"] = reported
         if not holding:
             result["outcome"] = "failure"
             result["failure"] = "grasp"
             return result
 
-        tcp_x, tcp_y, tcp_z, pick_yaw = await ep.tcp()
-        lifted = await ep.read_pose(spec.next_block)
         slot = spec.next_slot_pose
         _slot_x, _slot_y, sz = slot.position
         # Measured after the lift, so any slip in the grasp is accounted for:
@@ -700,12 +715,22 @@ def _parser() -> argparse.ArgumentParser:
         help="force one episode set; default samples A-E by the plan's weights",
     )
     parser.add_argument("--placed", type=int, help="force the starting tower size")
+    parser.add_argument(
+        "--scatter", action="store_true",
+        help="lay blocks not in the tower at random spots on the table instead of parking them",
+    )
+    parser.add_argument("--scatter-min-xy", type=_xy, default=jt.ScatterConfig.region_min_xy_m, help="scatter region corner X,Y (world, m)")
+    parser.add_argument("--scatter-max-xy", type=_xy, default=jt.ScatterConfig.region_max_xy_m)
     parser.add_argument("--chain", action="store_true", help="set F: build whole towers without resets")
     parser.add_argument("--layers", type=int, default=jt.TowerConfig.layers)
     parser.add_argument("--tower-xy", type=_xy, default=jt.TowerConfig.base_xy_m, help="tower centre X,Y in the arm base frame (m)")
     parser.add_argument("--tower-yaw-deg", type=float, default=0.0, help="tower yaw in the world frame")
     parser.add_argument(
-        "--slot-gap-m", type=float, default=0.0,
+        "--block-scale", type=float, default=1.0,
+        help="uniform scale for the Jenga blocks (must match the sim props), e.g. 0.416 so a Lite6 can grip one by its ends",
+    )
+    parser.add_argument(
+        "--slot-gap-m", type=float, default=jt.TowerConfig.slot_gap_m,
         help="extra spacing between blocks in a layer, e.g. room for a side-grip finger",
     )
     parser.add_argument("--supply-min-xy", type=_xy, default=jt.SupplyConfig.region_min_xy_m, help="supply region corner X,Y in the arm base frame (m)")
@@ -728,8 +753,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--wrist-camera", default=MachineNames.wrist_camera)
     parser.add_argument("--viam-config", type=Path, default=Path("/etc/viam.json"))
     parser.add_argument("--disable-webrtc", action="store_true")
-    parser.add_argument("--run-dir", type=Path, help="write episodes under RUN_DIR/episodes and results to RUN_DIR/results.jsonl")
-    parser.add_argument("--cosmos-output", action="store_true", help="also write CosmosWriter output under RUN_DIR/cosmoswriter")
+    parser.add_argument("--run-dir", type=Path, help="local directory for results.jsonl; also records episodes under RUN_DIR/episodes unless --episode-dir is set")
+    parser.add_argument(
+        "--episode-dir",
+        help="record episodes into this directory on the sim machine (e.g. a data manager capture_dir); defaults to RUN_DIR/episodes",
+    )
+    parser.add_argument("--cosmos-output", action="store_true", help="also write CosmosWriter output next to the episode directory, under cosmoswriter/")
+    parser.add_argument(
+        "--park-z-m", type=float, default=0.0,
+        help="with --print-props: height of the surface parked blocks rest on (e.g. a floor below the table)",
+    )
     parser.add_argument(
         "--print-props", action="store_true",
         help="print the sim world `props` entries for the tower and exit",
@@ -766,10 +799,14 @@ async def _run(args: argparse.Namespace) -> int:
             xs, ys = zip(*supply_corners)
             tower = jt.TowerConfig(
                 base_xy_m=tower_xy, base_yaw_deg=args.tower_yaw_deg, layers=args.layers,
-                slot_gap_m=args.slot_gap_m,
+                slot_gap_m=args.slot_gap_m, **jt.scaled_block_dims(args.block_scale),
             )
             supply = jt.SupplyConfig(
                 region_min_xy_m=(min(xs), min(ys)), region_max_xy_m=(max(xs), max(ys))
+            )
+            scatter = (
+                jt.ScatterConfig(region_min_xy_m=args.scatter_min_xy, region_max_xy_m=args.scatter_max_xy)
+                if args.scatter else None
             )
             world = Generic.from_robot(machine, names.world)
             gripper = Gripper.from_robot(machine, names.gripper)
@@ -800,10 +837,14 @@ async def _run(args: argparse.Namespace) -> int:
                     spec = jt.build_episode_spec(
                         seed, tower, supply,
                         episode_set=args.episode_set, placed_count=args.placed,
+                        scatter=scatter,
                     )
                     groups.append([(spec, f"{seed:06d}", True)])
 
             jobs = [job for group in groups for job in group]
+            episode_dir = args.episode_dir or (
+                str(args.run_dir / "episodes") if args.run_dir else None
+            )
             skip_until_reset = False
             for spec, episode_id, reset in jobs:
                 if skip_until_reset and not reset:
@@ -813,12 +854,10 @@ async def _run(args: argparse.Namespace) -> int:
                     world, gripper, motion, arm, spec, tower,
                     names=names, grasp=grasp, task=args.task, reset=reset,
                     home_joint_degrees=args.home_joints,
-                    episode_output_dir=(
-                        str(args.run_dir / "episodes") if args.run_dir else None
-                    ),
+                    episode_output_dir=episode_dir,
                     cosmos_output_dir=(
-                        str(args.run_dir / "cosmoswriter" / episode_id)
-                        if args.run_dir and args.cosmos_output else None
+                        str(Path(episode_dir).parent / "cosmoswriter" / episode_id)
+                        if episode_dir and args.cosmos_output else None
                     ),
                     episode_id=episode_id,
                 )
@@ -846,8 +885,10 @@ def main() -> int:
     parser = _parser()
     args = parser.parse_args()
     if args.print_props:
-        tower = jt.TowerConfig(layers=args.layers, slot_gap_m=args.slot_gap_m)
-        print(json.dumps(jt.tower_props(tower), indent=2))
+        tower = jt.TowerConfig(
+            layers=args.layers, slot_gap_m=args.slot_gap_m, **jt.scaled_block_dims(args.block_scale)
+        )
+        print(json.dumps(jt.tower_props(tower, park_z_m=args.park_z_m), indent=2))
         return 0
     if not args.address:
         parser.error("address is required unless --print-props is given")

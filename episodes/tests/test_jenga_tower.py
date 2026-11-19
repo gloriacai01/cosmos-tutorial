@@ -42,10 +42,13 @@ def test_layers_alternate_ninety_degrees_and_stack_by_thickness():
     assert odd.position[:2] == pytest.approx(TOWER.base_xy_m)
 
 
-def test_adjacent_slots_are_one_block_width_apart():
+def test_adjacent_slots_are_one_block_width_plus_the_seam_apart():
     a = jt.nominal_slot_pose(TOWER, jt.slot_ref(TOWER, 0))
     b = jt.nominal_slot_pose(TOWER, jt.slot_ref(TOWER, 1))
-    assert math.dist(a.position, b.position) == pytest.approx(jt.BLOCK_WIDTH_M)
+    assert TOWER.slot_gap_m > 0.0
+    assert math.dist(a.position, b.position) == pytest.approx(
+        jt.BLOCK_WIDTH_M + TOWER.slot_gap_m
+    )
 
 
 def test_tower_yaw_rotates_the_whole_layout():
@@ -57,11 +60,30 @@ def test_tower_yaw_rotates_the_whole_layout():
     assert (rx, ry) == pytest.approx((-dy, dx))
 
 
-def test_clean_tower_has_no_drift():
-    poses = jt.tower_poses(TOWER, seed=3, placed_count=9, drifted=False)
-    for k, name in enumerate(TOWER.block_names()[:9]):
+def test_clean_tower_has_only_seam_jitter():
+    """No layer drift, but every block is a fraction of a millimetre off so
+    seams show between blocks."""
+    poses = jt.tower_poses(TOWER, seed=3, placed_count=27, drifted=False)
+    drift = TOWER.drift
+    errors = []
+    for k, pose in enumerate(poses.values()):
         nominal = jt.nominal_slot_pose(TOWER, jt.slot_ref(TOWER, k))
-        assert poses[name] == nominal
+        error = jt.pose_error(pose, nominal)
+        assert error["z_m"] == 0.0
+        assert error["xy_m"] < 5 * drift.seam_jitter_xy_m
+        assert error["yaw_deg"] < 5 * drift.seam_jitter_yaw_deg
+        errors.append(error["xy_m"])
+    assert max(errors) > 0.0
+
+
+def test_props_are_shuffled_per_seed_and_cover_the_tower():
+    order = jt.prop_order(TOWER, 4)
+    assert sorted(order) == TOWER.block_names()
+    assert order == jt.prop_order(TOWER, 4)
+    assert order != jt.prop_order(TOWER, 5)
+    assert order != TOWER.block_names()
+    poses = jt.tower_poses(TOWER, seed=4, placed_count=10, drifted=False)
+    assert list(poses) == order[:10]
 
 
 def test_drift_is_bounded_reproducible_and_correlated():
@@ -115,8 +137,10 @@ def test_spec_is_reproducible():
 
 def test_next_block_and_slot_match_placed_count():
     spec = jt.build_episode_spec(5, TOWER, SUPPLY, episode_set="A", placed_count=4)
-    assert list(spec.tower_poses) == TOWER.block_names()[:4]
-    assert spec.next_block == "jenga_block_04"
+    order = jt.prop_order(TOWER, 5)
+    assert list(spec.tower_poses) == order[:4]
+    assert spec.next_block == order[4]
+    assert spec.next_block not in spec.tower_poses
     assert (spec.next_slot.layer, spec.next_slot.slot) == (1, 1)
 
 
@@ -125,7 +149,7 @@ def test_set_d_misplaces_the_last_block_within_range():
     for seed in range(100):
         spec = jt.build_episode_spec(seed, TOWER, SUPPLY, episode_set="D")
         assert spec.placed_count >= 1
-        assert spec.misplaced_block == TOWER.block_name(spec.placed_count - 1)
+        assert spec.misplaced_block == list(spec.tower_poses)[-1]
         error = jt.pose_error(spec.misplaced_pose, spec.tower_poses[spec.misplaced_block])
         lo, hi = sampling.misplace_xy_range_m
         assert lo - 1e-12 <= error["xy_m"] <= hi + 1e-12
@@ -183,3 +207,51 @@ def test_tower_props_cover_every_block_and_are_parked_apart():
     assert props[0]["scale"] == [0.075, 0.025, 0.015]
     positions = {tuple(p["position"]) for p in props}
     assert len(positions) == len(props)
+
+
+def test_scattered_blocks_are_apart_in_region_and_clear_of_tower_and_supply():
+    scatter = jt.ScatterConfig()
+    separation = math.hypot(TOWER.block_length_m, TOWER.block_width_m) + 0.006
+    for seed in range(30):
+        spec = jt.build_episode_spec(seed, TOWER, SUPPLY, episode_set="A", placed_count=40, scatter=scatter)
+        expected = jt.prop_order(TOWER, seed)[41:]
+        assert set(spec.scattered_poses) <= set(expected)
+        points = [p.position[:2] for p in spec.scattered_poses.values()]
+        for i, (x, y) in enumerate(points):
+            assert scatter.region_min_xy_m[0] <= x <= scatter.region_max_xy_m[0]
+            assert scatter.region_min_xy_m[1] <= y <= scatter.region_max_xy_m[1]
+            assert math.dist((x, y), spec.supply_pose.position[:2]) >= separation - 1e-12
+            assert math.dist((x, y), TOWER.base_xy_m) > jt.tower_footprint_radius(TOWER)
+            for other in points[i + 1:]:
+                assert math.dist((x, y), other) >= separation - 1e-12
+
+
+def test_no_scatter_by_default():
+    assert jt.build_episode_spec(3, TOWER, SUPPLY).scattered_poses == {}
+
+
+def test_scaled_tower_keeps_square_layers_and_scales_props():
+    small = jt.TowerConfig(**jt.scaled_block_dims(0.416))
+    assert small.block_length_m == pytest.approx(3 * small.block_width_m)
+    a = jt.nominal_slot_pose(small, jt.slot_ref(small, 0))
+    b = jt.nominal_slot_pose(small, jt.slot_ref(small, 1))
+    assert math.dist(a.position, b.position) == pytest.approx(
+        small.block_width_m + small.slot_gap_m
+    )
+    assert jt.tower_props(small)[0]["scale"] == pytest.approx([0.0312, 0.0104, 0.00624])
+    spec = jt.build_episode_spec(2, small, SUPPLY, episode_set="A", placed_count=20, scatter=jt.ScatterConfig())
+    points = [p.position[:2] for p in spec.scattered_poses.values()]
+    assert len(points) > 10  # small blocks pack much closer than full-size ones
+    with pytest.raises(ValueError):
+        jt.scaled_block_dims(0.0)
+
+
+def test_props_have_their_own_wood_shades_and_park_on_the_given_surface():
+    props = jt.tower_props(TOWER, park_z_m=-0.04)
+    colors = [tuple(p["color"]) for p in props]
+    assert len(set(colors)) == len(colors)
+    for color in colors:
+        assert all(0.0 <= c <= 1.0 for c in color)
+        assert color[0] > color[1] > color[2]  # warm wood, red > green > blue
+    assert all("visual_material" not in p for p in props)
+    assert props[0]["position"][2] == pytest.approx(-0.04 + jt.BLOCK_THICKNESS_M / 2)

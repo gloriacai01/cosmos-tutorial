@@ -38,6 +38,8 @@ class FakeSim:
         # Where the block ends up in the hand relative to where it was aimed:
         # tool-frame x, y (m) and yaw (deg).
         self.grasp_slip = (0.0, 0.0, 0.0)
+        # The real sim's firm-grasp flag can miss a held flat block.
+        self.report_holding = True
         self.moves: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
 
     # -- world ---------------------------------------------------------
@@ -173,7 +175,7 @@ class FakeSim:
             self._settle(name)
 
     async def is_holding_something(self):
-        holding = self.held is not None
+        holding = self.held is not None and self.report_holding
         return SimpleNamespace(is_holding_something=holding, meta={"firm_grasp": holding})
 
     async def is_moving(self):
@@ -246,6 +248,15 @@ def test_release_corrects_for_where_the_block_sits_in_the_hand():
     assert result["adjustments"] == []
     assert result["in_hand_offset"]["x_m"] == pytest.approx(0.004)
     assert result["in_hand_offset"]["yaw_deg"] == pytest.approx(3.0)
+
+
+def test_held_block_counts_even_when_the_gripper_says_otherwise():
+    sim = FakeSim(TOWER)
+    sim.report_holding = False
+    spec = jt.build_episode_spec(4, TOWER, SUPPLY, episode_set="D", placed_count=4)
+    result = _run(sim, spec)
+    assert result["outcome"] == "success", result
+    assert result["holding_after_lift"] and not result["gripper_reported_holding"]
 
 
 def test_side_grasp_also_places():
