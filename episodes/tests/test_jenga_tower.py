@@ -11,11 +11,11 @@ SUPPLY = jt.SupplyConfig()
 
 
 def test_block_names_follow_placement_order():
-    assert TOWER.block_count == 36  # 12 layers of 3
+    assert TOWER.block_count == 30  # 10 layers of 3
     assert TOWER.block_name(0) == "jenga_block_00"
-    assert TOWER.block_name(35) == "jenga_block_35"
+    assert TOWER.block_name(29) == "jenga_block_29"
     with pytest.raises(ValueError):
-        TOWER.block_name(36)
+        TOWER.block_name(30)
 
 
 def test_slot_ref_fills_layers_in_slot_order():
@@ -41,7 +41,7 @@ def test_default_fill_order_is_middle_then_near_side_then_far_side():
         ((-0.30, 0.10), 0.0, (0.0, 0.0)),
     ]:
         config = jt.TowerConfig(base_xy_m=base, base_yaw_deg=yaw, arm_xy_m=arm)
-        for layer in (0, 1, 4, 11):
+        for layer in (0, 1, 4, 9):
             refs = [jt.slot_ref(config, layer * 3 + i) for i in range(3)]
             assert {r.layer for r in refs} == {layer}
             assert refs[0].slot == 1
@@ -266,7 +266,7 @@ def test_scaled_tower_keeps_square_layers_and_scales_props():
         small.block_width_m + small.slot_gap_m
     )
     assert jt.tower_props(small)[0]["scale"] == pytest.approx([0.0312, 0.0104, 0.00624])
-    spec = jt.build_episode_spec(2, small, SUPPLY, episode_set="A", placed_count=20, scatter=jt.ScatterConfig())
+    spec = jt.build_episode_spec(2, small, SUPPLY, episode_set="A", placed_count=14, scatter=jt.ScatterConfig())
     points = [p.position[:2] for p in spec.scattered_poses.values()]
     assert len(points) > 10  # small blocks pack much closer than full-size ones
     with pytest.raises(ValueError):
@@ -285,7 +285,7 @@ def test_props_have_their_own_wood_shades_and_park_on_the_given_surface():
 
 
 def test_defaults_match_our_850_tower():
-    assert TOWER.layers == 12 and TOWER.block_count == 36
+    assert TOWER.layers == 10 and TOWER.block_count == 30
     assert TOWER.slot_gap_m == pytest.approx(0.003)
     tolerance = jt.PlacementTolerance()
     assert tolerance.xy_m == pytest.approx(0.002) and tolerance.yaw_deg == pytest.approx(2.0)

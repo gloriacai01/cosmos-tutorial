@@ -96,8 +96,8 @@ class TowerConfig:
     base_xy_m: tuple[float, float] = (0.30, 0.10)
     base_yaw_deg: float = 0.0
     support_z_m: float = 0.0
-    # Our towers are 12 layers (36 blocks, about 180 mm), not a full Jenga set.
-    layers: int = 12
+    # Our towers are 10 layers (30 blocks, about 150 mm), not a full Jenga set.
+    layers: int = 10
     slots_per_layer: int = 3
     # Fill order within a layer, as slot indices (0 = negative side of the
     # layer, slots_per_layer - 1 = positive side). None: middle first, then
