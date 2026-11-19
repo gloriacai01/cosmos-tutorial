@@ -40,6 +40,12 @@ class FakeSim:
         self.grasp_slip = (0.0, 0.0, 0.0)
         # The real sim's firm-grasp flag can miss a held flat block.
         self.report_holding = True
+        # Close on nothing, as a missed grasp would.
+        self.miss_grasp = False
+        # The jaws close on a block whose centre is this far above the TCP.
+        self.grasp_height = -pe.GraspConfig().grasp_z_offset_m
+        # Make the n-th streamed move raise, as a dropped connection would.
+        self.fail_on_move: int | None = None
         self.moves: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
 
     # -- world ---------------------------------------------------------
@@ -111,7 +117,7 @@ class FakeSim:
         pose = request["destination"]["pose"]
         target = (pose.get("x", 0.0) / 1000, pose.get("y", 0.0) / 1000, pose.get("z", 0.0) / 1000)
         self.planned = (target, -pose.get("theta", 0.0))
-        return {"plan": [{"pick-arm": [0.0] * 6}, {"pick-arm": [0.1] * 6}]}
+        return {"plan": [{"arm": [0.0] * 6}, {"arm": [0.1] * 6}]}
 
     async def move(self, _component, destination, constraints=None):
         pose = destination.pose
@@ -135,6 +141,8 @@ class FakeSim:
     async def stream(self, batches):
         async for _ in batches:
             pass
+        if self.fail_on_move is not None and len(self.moves) >= self.fail_on_move:
+            raise RuntimeError("stream dropped")
         assert self.planned is not None
         start = self.tcp
         self.tcp, self.tool_yaw = self.planned
@@ -155,8 +163,11 @@ class FakeSim:
 
     # -- gripper -------------------------------------------------------
     async def grab(self):
+        if self.miss_grasp:
+            return True
         for name, pose in self.props.items():
-            if math.dist(pose.position[:2], self.tcp[:2]) < 0.006 and abs(pose.position[2] - self.tcp[2]) < 0.006:
+            jaw_z = self.tcp[2] + self.grasp_height
+            if math.dist(pose.position[:2], self.tcp[:2]) < 0.006 and abs(pose.position[2] - jaw_z) < 0.006:
                 dx, dy, dz = (pose.position[i] - self.tcp[i] for i in range(3))
                 c = math.cos(math.radians(-self.tool_yaw))
                 s = math.sin(math.radians(-self.tool_yaw))
@@ -247,7 +258,9 @@ def test_release_corrects_for_where_the_block_sits_in_the_hand():
     assert result["outcome"] == "success", result
     assert result["adjustments"] == []
     assert result["in_hand_offset"]["x_m"] == pytest.approx(0.004)
-    assert result["in_hand_offset"]["yaw_deg"] == pytest.approx(3.0)
+    # The block's yaw in the tool frame: the slip plus the jaw offset.
+    expected = jt.wrap_deg(3.0 - pe.GraspConfig().jaw_yaw_offset_deg, 180.0)
+    assert result["in_hand_offset"]["yaw_deg"] == pytest.approx(expected)
 
 
 def test_held_block_counts_even_when_the_gripper_says_otherwise():
@@ -315,3 +328,61 @@ def test_chained_step_keeps_the_tower_and_moves_only_the_next_block():
     assert result["outcome"] == "success", result
     assert "reset" not in result
     assert sim.props[TOWER.block_name(0)] == placed_block
+
+
+def test_every_episode_ends_lifted_above_the_tower_holding_still():
+    sim = FakeSim(TOWER)
+    spec = jt.build_episode_spec(1, TOWER, SUPPLY, episode_set="A", placed_count=4)
+    result = _run(sim, spec)
+    assert result["outcome"] == "success", result
+    assert result["phases"][-2:] == [pe.STAGE_RETREAT, pe.STAGE_HOLD]
+    end_z = jt.tower_top_z(TOWER, spec.placed_count + 1) + pe.GraspConfig().end_lift_m
+    assert sim.tcp[2] >= end_z - 1e-9
+    assert sim.held is None  # the gripper is open
+    assert "end_hold" in result["timing"]["phases_sec"]
+    assert [m["label"] for m in result["timing"]["moves"]][-1] == "retreat"
+
+
+def test_a_missed_grasp_still_ends_lifted_open_and_holding():
+    sim = FakeSim(TOWER)
+    sim.miss_grasp = True
+    spec = jt.build_episode_spec(2, TOWER, SUPPLY, episode_set="A", placed_count=3)
+    result = _run(sim, spec)
+    assert result["outcome"] == "failure" and result["failure"] == "grasp"
+    assert result["phases"][-2:] == [pe.STAGE_RETREAT, pe.STAGE_HOLD]
+    assert sim.tcp[2] >= jt.tower_top_z(TOWER, spec.placed_count) + pe.GraspConfig().end_lift_m - 1e-9
+    assert not sim.capturing
+
+
+def test_release_turns_the_wrist_the_short_way():
+    slot = jt.Pose((0.3, 0.1, 0.05), -88.0)
+    lifted = jt.Pose((0.2, -0.1, 0.1), 85.0)
+    for pick_yaw in (85.0, -95.0, 175.0, 10.0):
+        _x, _y, place_yaw, _ = pe.release_target(slot, lifted, (0.2, -0.1), pick_yaw)
+        assert abs(place_yaw - pick_yaw) <= 90.0 + 1e-9
+        # The block still lands on the slot's axis (a block looks the same turned 180).
+        in_hand = jt.wrap_deg(lifted.yaw_deg - pick_yaw, 180.0)
+        assert jt.yaw_error_deg(place_yaw + in_hand, slot.yaw_deg) < 1e-9
+
+
+def test_release_re_aims_from_a_hover_before_the_final_lower():
+    sim = FakeSim(TOWER)
+    spec = jt.build_episode_spec(6, TOWER, SUPPLY, episode_set="C", placed_count=4)
+    result = _run(sim, spec)
+    assert result["outcome"] == "success", result
+    labels = [m["label"] for m in result["timing"]["moves"]]
+    i = labels.index("pre-release")
+    assert labels[i:i + 3] == ["pre-release", "re-aim", "release"]
+
+
+def test_an_error_ends_only_its_episode_and_closes_capture():
+    sim = FakeSim(TOWER)
+    sim.fail_on_move = 3
+    spec = jt.build_episode_spec(1, TOWER, SUPPLY, episode_set="A", placed_count=2)
+    world, gripper, motion, arm = _components(sim)
+    result = asyncio.run(
+        pe.run_episode_safely(world, gripper, motion, arm, spec, TOWER, episode_output_dir="out")
+    )
+    assert result["outcome"] == "error"
+    assert "stream dropped" in result["error"]
+    assert not sim.capturing

@@ -16,6 +16,19 @@ small errors.
 
 The tower blocks must exist as props in the sim world config; print them with
 `--print-props`.
+
+Every episode ends the same way, whatever its outcome: the arm lifts about
+10 cm above the new tower top and holds still with the gripper open for 3 s.
+The training loader never starts a sample in an episode's last 32 frames
+(~2.1 s at 15 Hz), so a shorter final hold would never teach the policy to
+stop; and the end pose differs from the home start, so the last frame never
+looks like the next episode's first.
+
+Defaults match our UFACTORY 850 + Gripper G2 sims: components `arm`,
+`gripper`, `overview-cam`, `front-cam`, `wrist-cam`, and armfarm01's saved
+home pose. The sim config should label the embodiment for the episode
+manifest and policy checks: arm `arm_model: "xarm850"`, gripper
+`gripper_model: "xarm_gripper_g2"`.
 """
 
 from __future__ import annotations
@@ -93,6 +106,14 @@ else:
     )
 
 DEFAULT_PROMPT = "place the next block on the tower"
+# Embodiment names for the UFACTORY 850 + Gripper G2, shared with the dataset
+# export and the real controller.
+ARM_MODEL = "xarm850"
+GRIPPER_MODEL = "xarm_gripper_g2"
+# armfarm01's saved home pose (its `home-pose` component), in degrees. The
+# oracle's default home is the Lite6's, whose joint 3 (+90 deg) is outside the
+# 850's range.
+UF850_HOME_JOINT_DEGREES = (0.0, 22.57, -50.69, 0.04, -74.04, -0.04)
 # Phase labels for the result record. Capture uses one "base" stage, as the
 # pick oracle does, so these are not written into the episode.
 STAGE_STRAIGHTEN = "straighten the top block of the tower"
@@ -123,18 +144,30 @@ class GraspConfig:
     84 mm stroke). "side" closes across the 25 mm width (fits the Lite6
     wide jaw; the fingers need room beside neighbouring blocks).
     `jaw_yaw_offset_deg` is the tool yaw at which the jaws close along world
-    X; calibrate it once per gripper asset."""
+    X; calibrate it once per gripper asset. The Gripper G2 needs 90: at tool
+    yaw 0 its jaws close along world Y (checked with the wrist camera on our
+    850 + G2 sim, Nov 19)."""
 
     axis: str = "end"
-    jaw_yaw_offset_deg: float = 0.0
+    jaw_yaw_offset_deg: float = 90.0
     # TCP height relative to the block centre while grasping. Keep the
     # fingertips inside the block's thickness so they clear the layer below.
-    grasp_z_offset_m: float = 0.0
+    # The G2's TCP (172 mm) lies 4.9 mm past its fingertips at a 75 mm grip,
+    # so 9.4 mm below the centre puts the fingertips 3 mm above the block's
+    # bottom: the grip our 850 + G2 sim lifted a block with (Nov 19).
+    grasp_z_offset_m: float = -0.0094
     approach_clearance_m: float = 0.10
-    carry_clearance_m: float = 0.06
+    carry_clearance_m: float = 0.08
     lift_height_m: float = 0.08
     release_clearance_m: float = 0.002
     release_settle_sec: float = 0.3
+    # Before the final lower: hover this far above the release height, let
+    # the arm settle, then re-aim from where the held block actually is.
+    reaim_height_m: float = 0.02
+    reaim_settle_sec: float = 0.5
+    # End of every episode: lift this far above the new tower top, then hold.
+    end_lift_m: float = 0.10
+    end_hold_sec: float = 3.0
     gripper_settle_sec: float = 3.0
     # Corrective re-grasp: lift this much, shift, lower, release.
     adjust_lift_m: float = 0.003
@@ -158,11 +191,11 @@ class NoiseConfig:
 @dataclass(frozen=True)
 class MachineNames:
     world: str = "sim-world"
-    arm: str = "pick-arm"
-    gripper: str = "pick-gripper"
+    arm: str = "arm"
+    gripper: str = "gripper"
     motion: str = "builtin"
-    fixed_camera: str = "scene-cam"
-    fixed_camera_2: str = "third-cam"
+    fixed_camera: str = "overview-cam"
+    fixed_camera_2: str = "front-cam"
     wrist_camera: str = "wrist-cam"
 
 
@@ -180,7 +213,9 @@ def release_target(
     """TCP x, y and tool yaw that put the held block, not the TCP, on `slot`.
 
     The block's offset and yaw relative to the tool are read after the lift
-    and carried rigidly with the tool to the slot."""
+    and carried rigidly with the tool to the slot. A block looks the same
+    turned 180 deg, so the tool turns whichever way is shorter: at most 90
+    deg from `pick_tool_yaw_deg`."""
     off_x = lifted.position[0] - tcp_xy[0]
     off_y = lifted.position[1] - tcp_xy[1]
     # Offset in the tool frame at pick time.
@@ -188,6 +223,7 @@ def release_target(
     tool_x, tool_y = c * off_x - s * off_y, s * off_x + c * off_y
     block_in_tool_deg = jt.wrap_deg(lifted.yaw_deg - pick_tool_yaw_deg, 180.0)
     place_yaw = jt.wrap_deg(slot.yaw_deg - block_in_tool_deg, 180.0)
+    place_yaw = pick_tool_yaw_deg + jt.wrap_deg(place_yaw - pick_tool_yaw_deg, 180.0)
     c, s = math.cos(math.radians(place_yaw)), math.sin(math.radians(place_yaw))
     world_x, world_y = c * tool_x - s * tool_y, s * tool_x + c * tool_y
     return (
@@ -398,6 +434,19 @@ class _Episode:
         )
         return await self.read_pose(block)
 
+    async def finish(self, end_top_z: float) -> None:
+        """End every episode the same way: lift straight up to `end_lift_m`
+        above `end_top_z` with the gripper open, then hold still."""
+        await self.mark(STAGE_RETREAT)
+        x, y, z, yaw = await self.tcp()
+        await self.go(
+            "retreat", x, y, max(z, end_top_z + self.grasp.end_lift_m), yaw,
+            LINEAR_PICK_CONSTRAINTS, MIN_SUBTASK_DURATION_SEC,
+        )
+        await self.mark(STAGE_HOLD)
+        with self.timer.phase("end_hold"):
+            await _wait_sim_duration(self.world, self.grasp.end_hold_sec)
+
 
 async def reset_tower(
     world: Any,
@@ -482,7 +531,7 @@ async def execute_place(
     cosmos_output_dir: str | None = None,
     task: str = DEFAULT_PROMPT,
     reset: bool = True,
-    home_joint_degrees: Sequence[float] = HOME_JOINT_DEGREES,
+    home_joint_degrees: Sequence[float] = UF850_HOME_JOINT_DEGREES,
 ) -> dict[str, Any]:
     """Run one placement episode from `spec`. With `reset=False` (chained
     builds) the tower is left as it stands."""
@@ -595,6 +644,8 @@ async def execute_place(
         if not holding:
             result["outcome"] = "failure"
             result["failure"] = "grasp"
+            await ep.open("open-after-miss")
+            await ep.finish(jt.tower_top_z(tower, spec.placed_count))
             return result
 
         slot = spec.next_slot_pose
@@ -623,8 +674,19 @@ async def execute_place(
             pre_x += rng.gauss(0.0, noise.arrival_xy_stdev_m)
             pre_y += rng.gauss(0.0, noise.arrival_xy_stdev_m)
             pre_yaw += rng.gauss(0.0, noise.arrival_yaw_stdev_deg)
+        hover_z = release_z + grasp.reaim_height_m
         await ep.go(
-            "pre-release", pre_x, pre_y, release_z + PRE_GRASP_CLEARANCE_M, pre_yaw,
+            "pre-release", pre_x, pre_y, hover_z, pre_yaw,
+            LINEAR_PICK_CONSTRAINTS, APPROACH_WAYPOINT_MIN_DURATION_SEC,
+        )
+        # Settle, then re-aim from where the block actually hangs: the arm's
+        # last few mm of settling would otherwise drag the layer below.
+        await _wait_sim_duration(world, grasp.reaim_settle_sec)
+        hx, hy, _hz, hyaw = await ep.tcp()
+        hanging = await ep.read_pose(spec.next_block)
+        sx, sy, yaw, _aim = release_target(slot, hanging, (hx, hy), hyaw)
+        await ep.go(
+            "re-aim", sx, sy, hover_z, yaw,
             LINEAR_PICK_CONSTRAINTS, APPROACH_WAYPOINT_MIN_DURATION_SEC,
         )
         await ep.go(
@@ -648,12 +710,7 @@ async def execute_place(
             adjustments.append({"block": spec.next_block, **error})
             attempts += 1
 
-        await ep.mark(STAGE_RETREAT)
-        rx, ry, _rz, ryaw = await ep.tcp()
-        await ep.go(
-            "retreat", rx, ry, max(carry_z, clear_z), ryaw,
-            LINEAR_PICK_CONSTRAINTS, MIN_SUBTASK_DURATION_SEC,
-        )
+        await ep.finish(jt.tower_top_z(tower, spec.placed_count + 1))
 
         after = await ep.read_poses(tower_names)
         moved = jt.disturbed_blocks(before, after, tolerance)
@@ -669,8 +726,6 @@ async def execute_place(
         result["outcome"] = "success" if success else "failure"
         if not success:
             result["failure"] = "disturbed" if moved else "placement"
-        else:
-            await ep.mark(STAGE_HOLD)
     finally:
         if ep.capturing:
             with ep.timer.phase("capture_stop"):
@@ -687,10 +742,54 @@ async def execute_place(
     return result
 
 
+async def close_open_episode(world: Any) -> None:
+    """Best-effort stop of a capture an interrupted episode left running, so
+    it can't block every later episode."""
+    try:
+        await asyncio.wait_for(
+            world.do_command({"command": "stop_episode", "outcome": "incomplete"}),
+            timeout=60,
+        )
+    except Exception:
+        # Usually the episode already closed its capture; nothing left to do.
+        pass
+
+
+async def run_episode_safely(
+    world: Any,
+    gripper: Any,
+    motion: Any,
+    arm: Any,
+    spec: jt.EpisodeSpec,
+    tower: jt.TowerConfig,
+    *,
+    timeout_sec: float = 0.0,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """`execute_place`, but an exception or a timeout ends only this episode:
+    it is recorded as outcome "error" and the batch carries on, as
+    batch_episodes.py does for picks."""
+    try:
+        run = execute_place(world, gripper, motion, arm, spec, tower, **kwargs)
+        if timeout_sec > 0:
+            return await asyncio.wait_for(run, timeout=timeout_sec)
+        return await run
+    except Exception as exc:
+        await close_open_episode(world)
+        return {
+            "spec": spec.summary(),
+            "outcome": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
 async def arm_to_world_xy(machine: Any, arm_name: str, x_m: float, y_m: float) -> tuple[float, float]:
+    """(x, y) in the arm's base frame to world. RDK names a component's static
+    origin frame `<name>_origin`; its model's link frames are `<name>:<link>`,
+    and the 850's base link is not called `base`."""
     transformed = await machine.transform_pose(
         PoseInFrame(
-            reference_frame=f"{arm_name}:base",
+            reference_frame=f"{arm_name}_origin",
             pose=ViamPose(x=x_m * 1000.0, y=y_m * 1000.0, z=0.0, o_z=1.0),
         ),
         "world",
@@ -736,12 +835,23 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--supply-min-xy", type=_xy, default=jt.SupplyConfig.region_min_xy_m, help="supply region corner X,Y in the arm base frame (m)")
     parser.add_argument("--supply-max-xy", type=_xy, default=jt.SupplyConfig.region_max_xy_m)
     parser.add_argument("--grasp-axis", choices=("end", "side"), default="end")
-    parser.add_argument("--jaw-yaw-offset-deg", type=float, default=0.0)
-    parser.add_argument("--grasp-z-offset-m", type=float, default=0.0)
+    parser.add_argument(
+        "--jaw-yaw-offset-deg", type=float, default=GraspConfig.jaw_yaw_offset_deg,
+        help="tool yaw at which the jaws close along world X (G2: 90)",
+    )
+    parser.add_argument(
+        "--grasp-z-offset-m", type=float, default=GraspConfig.grasp_z_offset_m,
+        help="TCP height relative to the block centre while grasping (G2: -0.0094)",
+    )
     parser.add_argument(
         "--home-joints", type=lambda s: [float(v) for v in s.split(",")],
-        default=list(HOME_JOINT_DEGREES),
-        help="comma-separated home joint angles in degrees; the default is the Lite6 home",
+        default=list(UF850_HOME_JOINT_DEGREES),
+        help="comma-separated home joint angles in degrees; the default is armfarm01's 850 home "
+        f"(the Lite6 home is {','.join(f'{v:g}' for v in HOME_JOINT_DEGREES)})",
+    )
+    parser.add_argument(
+        "--episode-timeout-sec", type=float, default=0.0,
+        help="end an episode that runs longer than this (0: no limit); it is recorded as an error",
     )
     parser.add_argument("--task", default=DEFAULT_PROMPT)
     parser.add_argument("--world", default=MachineNames.world)
@@ -799,6 +909,7 @@ async def _run(args: argparse.Namespace) -> int:
             xs, ys = zip(*supply_corners)
             tower = jt.TowerConfig(
                 base_xy_m=tower_xy, base_yaw_deg=args.tower_yaw_deg, layers=args.layers,
+                arm_xy_m=await arm_to_world_xy(machine, names.arm, 0.0, 0.0),
                 slot_gap_m=args.slot_gap_m, **jt.scaled_block_dims(args.block_scale),
             )
             supply = jt.SupplyConfig(
@@ -850,8 +961,9 @@ async def _run(args: argparse.Namespace) -> int:
                 if skip_until_reset and not reset:
                     continue
                 skip_until_reset = False
-                result = await execute_place(
+                result = await run_episode_safely(
                     world, gripper, motion, arm, spec, tower,
+                    timeout_sec=args.episode_timeout_sec,
                     names=names, grasp=grasp, task=args.task, reset=reset,
                     home_joint_degrees=args.home_joints,
                     episode_output_dir=episode_dir,
@@ -862,6 +974,7 @@ async def _run(args: argparse.Namespace) -> int:
                     episode_id=episode_id,
                 )
                 result["episode_id"] = episode_id
+                result["embodiment"] = {"arm_model": ARM_MODEL, "gripper_model": GRIPPER_MODEL}
                 line = json.dumps(result, sort_keys=True, default=str)
                 print(line, flush=True)
                 if results_file is not None:

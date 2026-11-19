@@ -11,11 +11,11 @@ SUPPLY = jt.SupplyConfig()
 
 
 def test_block_names_follow_placement_order():
-    assert TOWER.block_count == 54
+    assert TOWER.block_count == 30  # 10 layers of 3
     assert TOWER.block_name(0) == "jenga_block_00"
-    assert TOWER.block_name(53) == "jenga_block_53"
+    assert TOWER.block_name(29) == "jenga_block_29"
     with pytest.raises(ValueError):
-        TOWER.block_name(54)
+        TOWER.block_name(30)
 
 
 def test_slot_ref_fills_layers_in_slot_order():
@@ -26,14 +26,40 @@ def test_slot_ref_fills_layers_in_slot_order():
     ]
 
 
+def test_default_fill_order_is_middle_then_near_side_then_far_side():
+    # Default spot (0.30, 0.10), arm at the origin: slot 0 is nearer in both
+    # layer directions. With the tower on the other side of the arm, even
+    # layers' near side flips.
+    assert [jt.layer_slot_order(TOWER, layer) for layer in (0, 1)] == [(1, 0, 2), (1, 0, 2)]
+    other_side = jt.TowerConfig(base_xy_m=(0.30, -0.10))
+    assert [jt.layer_slot_order(other_side, layer) for layer in (0, 1)] == [(1, 2, 0), (1, 0, 2)]
+    for base, yaw, arm in [
+        ((0.30, 0.10), 0.0, (0.0, 0.0)),
+        ((0.30, -0.10), 0.0, (0.0, 0.0)),
+        ((0.25, 0.20), 35.0, (0.0, 0.0)),
+        ((0.30, 0.10), 0.0, (0.50, 0.40)),
+        ((-0.30, 0.10), 0.0, (0.0, 0.0)),
+    ]:
+        config = jt.TowerConfig(base_xy_m=base, base_yaw_deg=yaw, arm_xy_m=arm)
+        for layer in (0, 1, 4, 9):
+            refs = [jt.slot_ref(config, layer * 3 + i) for i in range(3)]
+            assert {r.layer for r in refs} == {layer}
+            assert refs[0].slot == 1
+            near, far = (
+                math.dist(jt.nominal_slot_pose(config, r).position[:2], arm) for r in refs[1:]
+            )
+            assert near < far, (base, yaw, arm, layer)
+
+
 def test_slot_order_must_be_a_permutation():
     with pytest.raises(ValueError):
         jt.TowerConfig(slot_order=(0, 0, 1))
 
 
 def test_layers_alternate_ninety_degrees_and_stack_by_thickness():
-    even = jt.nominal_slot_pose(TOWER, jt.slot_ref(TOWER, 1))
-    odd = jt.nominal_slot_pose(TOWER, jt.slot_ref(TOWER, 4))
+    # Each layer's first placement is its middle slot.
+    even = jt.nominal_slot_pose(TOWER, jt.slot_ref(TOWER, 0))
+    odd = jt.nominal_slot_pose(TOWER, jt.slot_ref(TOWER, 3))
     assert jt.yaw_error_deg(odd.yaw_deg, even.yaw_deg + 90.0) == pytest.approx(0.0)
     assert even.position[2] == pytest.approx(jt.BLOCK_THICKNESS_M / 2)
     assert odd.position[2] == pytest.approx(1.5 * jt.BLOCK_THICKNESS_M)
@@ -141,7 +167,8 @@ def test_next_block_and_slot_match_placed_count():
     assert list(spec.tower_poses) == order[:4]
     assert spec.next_block == order[4]
     assert spec.next_block not in spec.tower_poses
-    assert (spec.next_slot.layer, spec.next_slot.slot) == (1, 1)
+    # Layer 1's second block: the side nearer the arm (slot 0 at the default spot).
+    assert (spec.next_slot.layer, spec.next_slot.slot) == (1, 0)
 
 
 def test_set_d_misplaces_the_last_block_within_range():
@@ -213,8 +240,8 @@ def test_scattered_blocks_are_apart_in_region_and_clear_of_tower_and_supply():
     scatter = jt.ScatterConfig()
     separation = math.hypot(TOWER.block_length_m, TOWER.block_width_m) + 0.006
     for seed in range(30):
-        spec = jt.build_episode_spec(seed, TOWER, SUPPLY, episode_set="A", placed_count=40, scatter=scatter)
-        expected = jt.prop_order(TOWER, seed)[41:]
+        spec = jt.build_episode_spec(seed, TOWER, SUPPLY, episode_set="A", placed_count=20, scatter=scatter)
+        expected = jt.prop_order(TOWER, seed)[21:]
         assert set(spec.scattered_poses) <= set(expected)
         points = [p.position[:2] for p in spec.scattered_poses.values()]
         for i, (x, y) in enumerate(points):
@@ -239,7 +266,7 @@ def test_scaled_tower_keeps_square_layers_and_scales_props():
         small.block_width_m + small.slot_gap_m
     )
     assert jt.tower_props(small)[0]["scale"] == pytest.approx([0.0312, 0.0104, 0.00624])
-    spec = jt.build_episode_spec(2, small, SUPPLY, episode_set="A", placed_count=20, scatter=jt.ScatterConfig())
+    spec = jt.build_episode_spec(2, small, SUPPLY, episode_set="A", placed_count=14, scatter=jt.ScatterConfig())
     points = [p.position[:2] for p in spec.scattered_poses.values()]
     assert len(points) > 10  # small blocks pack much closer than full-size ones
     with pytest.raises(ValueError):
@@ -255,3 +282,50 @@ def test_props_have_their_own_wood_shades_and_park_on_the_given_surface():
         assert color[0] > color[1] > color[2]  # warm wood, red > green > blue
     assert all("visual_material" not in p for p in props)
     assert props[0]["position"][2] == pytest.approx(-0.04 + jt.BLOCK_THICKNESS_M / 2)
+
+
+def test_defaults_match_our_850_tower():
+    assert TOWER.layers == 10 and TOWER.block_count == 30
+    assert TOWER.slot_gap_m == pytest.approx(0.003)
+    tolerance = jt.PlacementTolerance()
+    assert tolerance.xy_m == pytest.approx(0.002) and tolerance.yaw_deg == pytest.approx(2.0)
+
+
+def test_blocks_overlap_on_their_footprints():
+    a = jt.Pose((0.0, 0.0, 0.0075), 0.0)
+    pitch = TOWER.block_width_m + TOWER.slot_gap_m
+    assert not jt.blocks_overlap(TOWER, a, jt.Pose((0.0, pitch, 0.0075), 0.0))
+    assert jt.blocks_overlap(TOWER, a, jt.Pose((0.0, 0.024, 0.0075), 0.0))
+    # A 5 deg turn swings the ends ~3.3 mm toward a neighbour 3 mm away.
+    assert jt.blocks_overlap(TOWER, a, jt.Pose((0.0, pitch, 0.0075), 5.0))
+    assert jt.blocks_overlap(TOWER, a, jt.Pose((0.0, pitch, 0.0075), 0.0), margin_m=0.0031)
+
+
+def _same_layer_pairs(spec):
+    poses = dict(spec.tower_poses)
+    if spec.misplaced_block is not None:
+        poses[spec.misplaced_block] = spec.misplaced_pose
+    names = list(spec.tower_poses)
+    for i, a in enumerate(names):
+        for j in range(i + 1, len(names)):
+            if jt.slot_ref(TOWER, i).layer == jt.slot_ref(TOWER, j).layer:
+                yield poses[a], poses[names[j]]
+
+
+@pytest.mark.parametrize("episode_set", ["A", "B", "D"])
+def test_generated_towers_never_start_overlapping(episode_set):
+    for seed in range(300):
+        spec = jt.build_episode_spec(seed, TOWER, SUPPLY, episode_set=episode_set)
+        for a, b in _same_layer_pairs(spec):
+            assert not jt.blocks_overlap(TOWER, a, b), (seed, a, b)
+
+
+def test_set_d_still_misplaces_its_block():
+    moved = 0
+    for seed in range(100):
+        spec = jt.build_episode_spec(seed, TOWER, SUPPLY, episode_set="D")
+        error = jt.pose_error(spec.misplaced_pose, spec.tower_poses[spec.misplaced_block])
+        assert error["xy_m"] >= 0.002 - 1e-12
+        moved += error["yaw_deg"] >= 2.0 - 1e-9
+    # Most draws keep a 2-5 deg turn; only blocks boxed in by neighbours lose it.
+    assert moved >= 50
