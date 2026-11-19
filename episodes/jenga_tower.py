@@ -94,7 +94,8 @@ class TowerConfig:
     base_xy_m: tuple[float, float] = (0.30, 0.10)
     base_yaw_deg: float = 0.0
     support_z_m: float = 0.0
-    layers: int = 18
+    # Our towers are 12 layers (36 blocks, about 180 mm), not a full Jenga set.
+    layers: int = 12
     slots_per_layer: int = 3
     # Fill order within a layer, as slot indices (0 = negative side of the
     # layer, slots_per_layer - 1 = positive side). Fixed so identical images
@@ -103,9 +104,11 @@ class TowerConfig:
     block_length_m: float = BLOCK_LENGTH_M
     block_width_m: float = BLOCK_WIDTH_M
     block_thickness_m: float = BLOCK_THICKNESS_M
-    # Centre-to-centre spacing beyond the block width. The default is a real
-    # tower's seam; use more (e.g. 0.012) for room for a side-grip finger.
-    slot_gap_m: float = 0.0008
+    # Centre-to-centre spacing beyond the block width. The Gripper G2's pads
+    # are about 29.6 mm wide against a 25 mm block, so in an end grip each pad
+    # overhangs its block by ~2.3 mm toward the neighbours; 3 mm keeps them
+    # clear. Use more (e.g. 0.012) for room for a side-grip finger.
+    slot_gap_m: float = 0.003
     prop_prefix: str = BLOCK_PROP_PREFIX
     drift: DriftConfig = field(default_factory=DriftConfig)
 
@@ -363,16 +366,23 @@ def tower_poses(
     xy_sd = drift.block_jitter_xy_m if drifted else drift.seam_jitter_xy_m
     yaw_sd = drift.block_jitter_yaw_deg if drifted else drift.seam_jitter_yaw_deg
     poses: dict[str, Pose] = {}
+    by_layer: dict[int, list[Pose]] = {}
     for k in range(placed_count):
         ref = slot_ref(config, k)
         (ox, oy), oyaw = offsets[ref.layer]
-        pose = nominal_slot_pose(config, ref, (ox, oy), oyaw)
+        nominal = nominal_slot_pose(config, ref, (ox, oy), oyaw)
         jx, jy = jitter.gauss(0.0, xy_sd), jitter.gauss(0.0, xy_sd)
         jyaw = jitter.gauss(0.0, yaw_sd)
         pose = Pose(
-            (pose.position[0] + jx, pose.position[1] + jy, pose.position[2]),
-            wrap_deg(pose.yaw_deg + jyaw, 180.0),
+            (nominal.position[0] + jx, nominal.position[1] + jy, nominal.position[2]),
+            wrap_deg(nominal.yaw_deg + jyaw, 180.0),
         )
+        neighbours = by_layer.setdefault(ref.layer, [])
+        if any(blocks_overlap(config, pose, other, BLOCK_CLEARANCE_M) for other in neighbours):
+            # The jitter would push this block into a neighbour: keep its
+            # layer's pose instead, so a reset never starts interpenetrating.
+            pose = nominal
+        neighbours.append(pose)
         poses[names[k]] = pose
     return poses
 
@@ -401,6 +411,35 @@ def tower_footprint_radius(config: TowerConfig) -> float:
     pitch = config.block_width_m + config.slot_gap_m
     half_across = (config.slots_per_layer * pitch) / 2.0
     return math.hypot(max(half_long, half_across), max(half_long, half_across))
+
+
+# Blocks side by side in a layer keep at least this much clear space between
+# them when a tower is generated, so resets never start interpenetrating.
+BLOCK_CLEARANCE_M = 0.0005
+
+
+def block_corners_xy(config: TowerConfig, pose: Pose) -> list[tuple[float, float]]:
+    """The four corners of a flat block's footprint in world XY."""
+    half_long, half_wide = config.block_length_m / 2.0, config.block_width_m / 2.0
+    x, y = pose.position[0], pose.position[1]
+    corners = []
+    for sx, sy in ((1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)):
+        dx, dy = _rotate_xy(sx * half_long, sy * half_wide, pose.yaw_deg)
+        corners.append((x + dx, y + dy))
+    return corners
+
+
+def blocks_overlap(config: TowerConfig, a: Pose, b: Pose, margin_m: float = 0.0) -> bool:
+    """Whether two flat blocks' footprints overlap, or come within `margin_m`
+    of each other (separating-axis test on two rectangles)."""
+    corners_a, corners_b = block_corners_xy(config, a), block_corners_xy(config, b)
+    for yaw in (a.yaw_deg, b.yaw_deg):
+        for axis in (_rotate_xy(1.0, 0.0, yaw), _rotate_xy(0.0, 1.0, yaw)):
+            pa = [px * axis[0] + py * axis[1] for px, py in corners_a]
+            pb = [px * axis[0] + py * axis[1] for px, py in corners_b]
+            if max(pa) + margin_m <= min(pb) or max(pb) + margin_m <= min(pa):
+                return False
+    return True
 
 
 def sample_supply_pose(
@@ -472,17 +511,33 @@ def sample_episode_set(seed: int, weights: Mapping[str, float]) -> str:
 
 
 def _misplaced(
-    target: Pose, sampling: EpisodeSamplingConfig, seed: int
+    config: TowerConfig,
+    target: Pose,
+    neighbours: Sequence[Pose],
+    sampling: EpisodeSamplingConfig,
+    seed: int,
 ) -> Pose:
+    """Set D's starting error: the block shifted 2-5 mm and turned 2-5 deg,
+    drawn until it clears the other blocks in its layer.
+
+    A side block can't move far toward its neighbour (the gap is only a few
+    mm) and a 5 deg turn alone swings its ends by ~3 mm, so draws that would
+    overlap are rejected. If none fits, the block slides along its own long
+    axis, where a layer has no neighbours."""
     rng = _rng("misplace", seed)
-    distance = rng.uniform(*sampling.misplace_xy_range_m)
-    heading = rng.uniform(0.0, 2.0 * math.pi)
-    yaw = rng.uniform(*sampling.misplace_yaw_range_deg) * rng.choice((-1.0, 1.0))
     x, y, z = target.position
-    return Pose(
-        (x + distance * math.cos(heading), y + distance * math.sin(heading), z),
-        wrap_deg(target.yaw_deg + yaw, 180.0),
-    )
+    for _attempt in range(64):
+        distance = rng.uniform(*sampling.misplace_xy_range_m)
+        heading = rng.uniform(0.0, 2.0 * math.pi)
+        yaw = rng.uniform(*sampling.misplace_yaw_range_deg) * rng.choice((-1.0, 1.0))
+        pose = Pose(
+            (x + distance * math.cos(heading), y + distance * math.sin(heading), z),
+            wrap_deg(target.yaw_deg + yaw, 180.0),
+        )
+        if not any(blocks_overlap(config, pose, n, BLOCK_CLEARANCE_M) for n in neighbours):
+            return pose
+    dx, dy = _rotate_xy(sampling.misplace_xy_range_m[0], 0.0, target.yaw_deg)
+    return Pose((x + dx, y + dy, z), target.yaw_deg)
 
 
 def build_episode_spec(
@@ -521,7 +576,14 @@ def build_episode_spec(
     misplaced_block = misplaced_pose = None
     if chosen == "D":
         misplaced_block = names[placed_count - 1]
-        misplaced_pose = _misplaced(poses[misplaced_block], sampling, seed)
+        layer = slot_ref(tower, placed_count - 1).layer
+        neighbours = [
+            poses[names[k]] for k in range(placed_count - 1)
+            if slot_ref(tower, k).layer == layer
+        ]
+        misplaced_pose = _misplaced(
+            tower, poses[misplaced_block], neighbours, sampling, seed
+        )
 
     failed_aim = None
     if chosen == "E":
@@ -560,8 +622,10 @@ def build_episode_spec(
 
 @dataclass(frozen=True)
 class PlacementTolerance:
-    xy_m: float = 0.001
-    yaw_deg: float = 1.0
+    # Our sim towers stood with random per-block errors up to ~4 mm / 2 deg
+    # (Oct 29 test); 2 mm / 2 deg is the success bar and the re-grasp trigger.
+    xy_m: float = 0.002
+    yaw_deg: float = 2.0
     z_m: float = 0.003
     # How far any other tower block may move during the episode.
     disturbed_xy_m: float = 0.002

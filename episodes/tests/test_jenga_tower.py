@@ -11,11 +11,11 @@ SUPPLY = jt.SupplyConfig()
 
 
 def test_block_names_follow_placement_order():
-    assert TOWER.block_count == 54
+    assert TOWER.block_count == 36  # 12 layers of 3
     assert TOWER.block_name(0) == "jenga_block_00"
-    assert TOWER.block_name(53) == "jenga_block_53"
+    assert TOWER.block_name(35) == "jenga_block_35"
     with pytest.raises(ValueError):
-        TOWER.block_name(54)
+        TOWER.block_name(36)
 
 
 def test_slot_ref_fills_layers_in_slot_order():
@@ -213,8 +213,8 @@ def test_scattered_blocks_are_apart_in_region_and_clear_of_tower_and_supply():
     scatter = jt.ScatterConfig()
     separation = math.hypot(TOWER.block_length_m, TOWER.block_width_m) + 0.006
     for seed in range(30):
-        spec = jt.build_episode_spec(seed, TOWER, SUPPLY, episode_set="A", placed_count=40, scatter=scatter)
-        expected = jt.prop_order(TOWER, seed)[41:]
+        spec = jt.build_episode_spec(seed, TOWER, SUPPLY, episode_set="A", placed_count=20, scatter=scatter)
+        expected = jt.prop_order(TOWER, seed)[21:]
         assert set(spec.scattered_poses) <= set(expected)
         points = [p.position[:2] for p in spec.scattered_poses.values()]
         for i, (x, y) in enumerate(points):
@@ -255,3 +255,50 @@ def test_props_have_their_own_wood_shades_and_park_on_the_given_surface():
         assert color[0] > color[1] > color[2]  # warm wood, red > green > blue
     assert all("visual_material" not in p for p in props)
     assert props[0]["position"][2] == pytest.approx(-0.04 + jt.BLOCK_THICKNESS_M / 2)
+
+
+def test_defaults_match_our_850_tower():
+    assert TOWER.layers == 12 and TOWER.block_count == 36
+    assert TOWER.slot_gap_m == pytest.approx(0.003)
+    tolerance = jt.PlacementTolerance()
+    assert tolerance.xy_m == pytest.approx(0.002) and tolerance.yaw_deg == pytest.approx(2.0)
+
+
+def test_blocks_overlap_on_their_footprints():
+    a = jt.Pose((0.0, 0.0, 0.0075), 0.0)
+    pitch = TOWER.block_width_m + TOWER.slot_gap_m
+    assert not jt.blocks_overlap(TOWER, a, jt.Pose((0.0, pitch, 0.0075), 0.0))
+    assert jt.blocks_overlap(TOWER, a, jt.Pose((0.0, 0.024, 0.0075), 0.0))
+    # A 5 deg turn swings the ends ~3.3 mm toward a neighbour 3 mm away.
+    assert jt.blocks_overlap(TOWER, a, jt.Pose((0.0, pitch, 0.0075), 5.0))
+    assert jt.blocks_overlap(TOWER, a, jt.Pose((0.0, pitch, 0.0075), 0.0), margin_m=0.0031)
+
+
+def _same_layer_pairs(spec):
+    poses = dict(spec.tower_poses)
+    if spec.misplaced_block is not None:
+        poses[spec.misplaced_block] = spec.misplaced_pose
+    names = list(spec.tower_poses)
+    for i, a in enumerate(names):
+        for j in range(i + 1, len(names)):
+            if jt.slot_ref(TOWER, i).layer == jt.slot_ref(TOWER, j).layer:
+                yield poses[a], poses[names[j]]
+
+
+@pytest.mark.parametrize("episode_set", ["A", "B", "D"])
+def test_generated_towers_never_start_overlapping(episode_set):
+    for seed in range(300):
+        spec = jt.build_episode_spec(seed, TOWER, SUPPLY, episode_set=episode_set)
+        for a, b in _same_layer_pairs(spec):
+            assert not jt.blocks_overlap(TOWER, a, b), (seed, a, b)
+
+
+def test_set_d_still_misplaces_its_block():
+    moved = 0
+    for seed in range(100):
+        spec = jt.build_episode_spec(seed, TOWER, SUPPLY, episode_set="D")
+        error = jt.pose_error(spec.misplaced_pose, spec.tower_poses[spec.misplaced_block])
+        assert error["xy_m"] >= 0.002 - 1e-12
+        moved += error["yaw_deg"] >= 2.0 - 1e-9
+    # Most draws keep a 2-5 deg turn; only blocks boxed in by neighbours lose it.
+    assert moved >= 50
