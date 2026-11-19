@@ -7,7 +7,7 @@ import jenga_tower as jt
 
 
 TOWER = jt.TowerConfig()
-SUPPLY = jt.SupplyConfig()
+SCATTER = jt.ScatterConfig()
 
 
 def test_block_names_follow_placement_order():
@@ -127,13 +127,76 @@ def test_drift_is_bounded_reproducible_and_correlated():
     assert max(steps) < drift.max_layer_offset_xy_m
 
 
-def test_supply_pose_is_inside_region_and_clear_of_tower():
-    for seed in range(200):
-        pose = jt.sample_supply_pose(TOWER, SUPPLY, seed)
-        assert SUPPLY.region_min_xy_m[0] <= pose.position[0] <= SUPPLY.region_max_xy_m[0]
-        assert SUPPLY.region_min_xy_m[1] <= pose.position[1] <= SUPPLY.region_max_xy_m[1]
-        assert pose.position[2] == pytest.approx(jt.BLOCK_THICKNESS_M / 2)
-        assert math.dist(pose.position[:2], TOWER.base_xy_m) > jt.tower_footprint_radius(TOWER)
+def _at(x, y, yaw=0.0, z=jt.BLOCK_THICKNESS_M / 2):
+    return jt.Pose((x, y, z), yaw)
+
+
+@pytest.mark.parametrize("placed", [0, 20, 29])
+def test_every_loose_block_lies_flat_apart_in_the_region_and_clear_of_the_tower(placed):
+    for seed in range(15):
+        spec = jt.build_episode_spec(seed, TOWER, SCATTER, episode_set="A", placed_count=placed)
+        assert list(spec.loose_poses) == jt.prop_order(TOWER, seed)[placed:]
+        poses = list(spec.loose_poses.values())
+        for i, pose in enumerate(poses):
+            for x, y in jt.block_corners_xy(TOWER, pose):
+                assert SCATTER.region_min_xy_m[0] - 1e-9 <= x <= SCATTER.region_max_xy_m[0] + 1e-9
+                assert SCATTER.region_min_xy_m[1] - 1e-9 <= y <= SCATTER.region_max_xy_m[1] + 1e-9
+            assert pose.position[2] == pytest.approx(jt.BLOCK_THICKNESS_M / 2)
+            reach = jt.tower_footprint_radius(TOWER) + SCATTER.tower_clearance_m
+            assert all(math.dist(c, TOWER.base_xy_m) >= reach for c in jt.block_corners_xy(TOWER, pose))
+            for other in poses[i + 1:]:
+                assert not jt.blocks_overlap(TOWER, pose, other, SCATTER.min_gap_m - 1e-9)
+
+
+def test_pick_rule_takes_the_nearest_flat_block_with_both_ends_clear():
+    tower = jt.TowerConfig(base_xy_m=(0.3, 0.1))
+    loose = {
+        "too_close": _at(0.42, 0.1),  # 12 cm from the tower centre
+        "end_blocked": _at(0.3, -0.04),  # 14 cm, but a block lies across its +x end
+        "blocker": _at(0.36, -0.04, 90.0),  # 15.2 cm, ends clear
+        "on_its_side": _at(0.3, 0.235, z=jt.BLOCK_WIDTH_M / 2),  # 13.5 cm, not flat
+        "clear": _at(0.155, 0.1),  # 14.5 cm, ends clear
+        "farther": _at(0.3, 0.3),  # 20 cm
+    }
+    assert jt.choose_pick_block(tower, SCATTER, loose) == "clear"
+    del loose["clear"]
+    assert jt.choose_pick_block(tower, SCATTER, loose) == "blocker"
+    assert jt.choose_pick_block(
+        tower, SCATTER, {k: loose[k] for k in ("too_close", "on_its_side")}
+    ) is None
+
+
+def test_finger_zones_sit_beyond_each_end_of_the_block():
+    zones = jt.finger_zones(TOWER, SCATTER, _at(0.4, 0.0, 90.0))
+    ys = sorted(sum(y for _x, y in zone) / 4 for zone in zones)
+    reach = jt.BLOCK_LENGTH_M / 2 + SCATTER.finger_clear_length_m / 2
+    assert ys == pytest.approx([-reach, reach])
+
+
+def test_spec_picks_its_next_block_by_the_rule():
+    for seed in range(20):
+        spec = jt.build_episode_spec(seed, TOWER, SCATTER, episode_set="A")
+        assert spec.next_block == jt.choose_pick_block(TOWER, SCATTER, spec.loose_poses)
+        assert spec.pick_pose == spec.loose_poses[spec.next_block]
+        assert math.dist(spec.pick_pose.position[:2], TOWER.base_xy_m) >= SCATTER.min_pick_distance_m
+
+
+def test_a_region_too_small_for_the_loose_blocks_is_an_error():
+    cramped = jt.ScatterConfig(region_min_xy_m=(0.40, -0.10), region_max_xy_m=(0.55, 0.10))
+    with pytest.raises(ValueError):
+        jt.build_episode_spec(0, TOWER, cramped, episode_set="A", placed_count=0)
+
+
+def test_chain_step_builds_on_the_tower_and_picks_from_where_blocks_lie():
+    first = jt.build_episode_spec(4, TOWER, SCATTER, episode_set="F", placed_count=0)
+    built = [first.next_block]
+    loose = {n: p for n, p in first.loose_poses.items() if n != first.next_block}
+    step = jt.chain_step_spec(4, TOWER, SCATTER, built, loose)
+    assert step.placed_count == 1 and list(step.tower_poses) == built
+    assert step.next_block == jt.choose_pick_block(TOWER, SCATTER, loose)
+    assert step.loose_poses == loose  # nothing is moved for the next step
+    assert step.next_slot == jt.slot_ref(TOWER, 1)
+    assert jt.chain_step_spec(4, TOWER, SCATTER, built, {}) is None
 
 
 def test_episode_sets_follow_weights():
@@ -149,23 +212,23 @@ def test_set_f_is_not_sampled_per_seed():
 
 
 def test_tower_height_is_uniform_over_slots():
-    heights = Counter(
-        jt.build_episode_spec(s, TOWER, SUPPLY, episode_set="A").placed_count
-        for s in range(5400)
+    heights = Counter(jt.sample_tower_height(TOWER, s, "A") for s in range(5400))
+    assert jt.build_episode_spec(3, TOWER, SCATTER, episode_set="A").placed_count == (
+        jt.sample_tower_height(TOWER, 3, "A")
     )
     assert set(heights) == set(range(TOWER.block_count))
     assert max(heights.values()) < 3 * min(heights.values())
 
 
 def test_spec_is_reproducible():
-    assert jt.build_episode_spec(7, TOWER, SUPPLY) == jt.build_episode_spec(7, TOWER, SUPPLY)
+    assert jt.build_episode_spec(7, TOWER, SCATTER) == jt.build_episode_spec(7, TOWER, SCATTER)
 
 
 def test_next_block_and_slot_match_placed_count():
-    spec = jt.build_episode_spec(5, TOWER, SUPPLY, episode_set="A", placed_count=4)
+    spec = jt.build_episode_spec(5, TOWER, SCATTER, episode_set="A", placed_count=4)
     order = jt.prop_order(TOWER, 5)
     assert list(spec.tower_poses) == order[:4]
-    assert spec.next_block == order[4]
+    assert spec.next_block in order[4:]
     assert spec.next_block not in spec.tower_poses
     # Layer 1's second block: the side nearer the arm (slot 0 at the default spot).
     assert (spec.next_slot.layer, spec.next_slot.slot) == (1, 0)
@@ -174,7 +237,7 @@ def test_next_block_and_slot_match_placed_count():
 def test_set_d_misplaces_the_last_block_within_range():
     sampling = jt.EpisodeSamplingConfig()
     for seed in range(100):
-        spec = jt.build_episode_spec(seed, TOWER, SUPPLY, episode_set="D")
+        spec = jt.build_episode_spec(seed, TOWER, SCATTER, episode_set="D")
         assert spec.placed_count >= 1
         assert spec.misplaced_block == list(spec.tower_poses)[-1]
         error = jt.pose_error(spec.misplaced_pose, spec.tower_poses[spec.misplaced_block])
@@ -187,16 +250,16 @@ def test_set_d_misplaces_the_last_block_within_range():
 
 def test_set_d_rejects_empty_tower():
     with pytest.raises(ValueError):
-        jt.build_episode_spec(0, TOWER, SUPPLY, episode_set="D", placed_count=0)
+        jt.build_episode_spec(0, TOWER, SCATTER, episode_set="D", placed_count=0)
 
 
 def test_set_flags():
-    c = jt.build_episode_spec(1, TOWER, SUPPLY, episode_set="C")
-    e = jt.build_episode_spec(1, TOWER, SUPPLY, episode_set="E")
-    a = jt.build_episode_spec(1, TOWER, SUPPLY, episode_set="A")
+    c = jt.build_episode_spec(1, TOWER, SCATTER, episode_set="C")
+    e = jt.build_episode_spec(1, TOWER, SCATTER, episode_set="E")
+    a = jt.build_episode_spec(1, TOWER, SCATTER, episode_set="A")
     assert c.perturbed_start and not a.perturbed_start
     assert e.failed_grasp_aim_xy_m is not None and a.failed_grasp_aim_xy_m is None
-    offset = math.dist(e.failed_grasp_aim_xy_m, e.supply_pose.position[:2])
+    offset = math.dist(e.failed_grasp_aim_xy_m, e.pick_pose.position[:2])
     assert 0.01 <= offset <= 0.03
 
 
@@ -236,27 +299,6 @@ def test_tower_props_cover_every_block_and_are_parked_apart():
     assert len(positions) == len(props)
 
 
-def test_scattered_blocks_are_apart_in_region_and_clear_of_tower_and_supply():
-    scatter = jt.ScatterConfig()
-    separation = math.hypot(TOWER.block_length_m, TOWER.block_width_m) + 0.006
-    for seed in range(30):
-        spec = jt.build_episode_spec(seed, TOWER, SUPPLY, episode_set="A", placed_count=20, scatter=scatter)
-        expected = jt.prop_order(TOWER, seed)[21:]
-        assert set(spec.scattered_poses) <= set(expected)
-        points = [p.position[:2] for p in spec.scattered_poses.values()]
-        for i, (x, y) in enumerate(points):
-            assert scatter.region_min_xy_m[0] <= x <= scatter.region_max_xy_m[0]
-            assert scatter.region_min_xy_m[1] <= y <= scatter.region_max_xy_m[1]
-            assert math.dist((x, y), spec.supply_pose.position[:2]) >= separation - 1e-12
-            assert math.dist((x, y), TOWER.base_xy_m) > jt.tower_footprint_radius(TOWER)
-            for other in points[i + 1:]:
-                assert math.dist((x, y), other) >= separation - 1e-12
-
-
-def test_no_scatter_by_default():
-    assert jt.build_episode_spec(3, TOWER, SUPPLY).scattered_poses == {}
-
-
 def test_scaled_tower_keeps_square_layers_and_scales_props():
     small = jt.TowerConfig(**jt.scaled_block_dims(0.416))
     assert small.block_length_m == pytest.approx(3 * small.block_width_m)
@@ -266,9 +308,8 @@ def test_scaled_tower_keeps_square_layers_and_scales_props():
         small.block_width_m + small.slot_gap_m
     )
     assert jt.tower_props(small)[0]["scale"] == pytest.approx([0.0312, 0.0104, 0.00624])
-    spec = jt.build_episode_spec(2, small, SUPPLY, episode_set="A", placed_count=14, scatter=jt.ScatterConfig())
-    points = [p.position[:2] for p in spec.scattered_poses.values()]
-    assert len(points) > 10  # small blocks pack much closer than full-size ones
+    spec = jt.build_episode_spec(2, small, SCATTER, episode_set="A", placed_count=20)
+    assert len(spec.loose_poses) == small.block_count - 20
     with pytest.raises(ValueError):
         jt.scaled_block_dims(0.0)
 
@@ -315,7 +356,7 @@ def _same_layer_pairs(spec):
 @pytest.mark.parametrize("episode_set", ["A", "B", "D"])
 def test_generated_towers_never_start_overlapping(episode_set):
     for seed in range(300):
-        spec = jt.build_episode_spec(seed, TOWER, SUPPLY, episode_set=episode_set)
+        spec = jt.build_episode_spec(seed, TOWER, SCATTER, episode_set=episode_set)
         for a, b in _same_layer_pairs(spec):
             assert not jt.blocks_overlap(TOWER, a, b), (seed, a, b)
 
@@ -323,7 +364,7 @@ def test_generated_towers_never_start_overlapping(episode_set):
 def test_set_d_still_misplaces_its_block():
     moved = 0
     for seed in range(100):
-        spec = jt.build_episode_spec(seed, TOWER, SUPPLY, episode_set="D")
+        spec = jt.build_episode_spec(seed, TOWER, SCATTER, episode_set="D")
         error = jt.pose_error(spec.misplaced_pose, spec.tower_poses[spec.misplaced_block])
         assert error["xy_m"] >= 0.002 - 1e-12
         moved += error["yaw_deg"] >= 2.0 - 1e-9

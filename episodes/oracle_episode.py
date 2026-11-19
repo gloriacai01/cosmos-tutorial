@@ -300,16 +300,17 @@ async def _stop_episode_capture(
         raise
 
 
-async def _start_episode_capture(world: Any, command: Mapping[str, Any]) -> None:
-    """Start capture and its base stage with cancellation-safe rollback."""
+async def _start_episode_capture(
+    world: Any, command: Mapping[str, Any], stage: str = DEFAULT_SUBTASK_PROMPT
+) -> None:
+    """Start capture and its first stage (by default the base stage) with
+    cancellation-safe rollback."""
     start_task = asyncio.create_task(world.do_command(dict(command)))
     started = False
     try:
         await asyncio.shield(start_task)
         started = True
-        await world.do_command(
-            {"command": "mark_episode_stage", "task": DEFAULT_SUBTASK_PROMPT}
-        )
+        await world.do_command({"command": "mark_episode_stage", "task": stage})
     except BaseException:
         if not started:
             try:

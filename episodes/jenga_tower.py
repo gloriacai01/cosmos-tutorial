@@ -17,6 +17,10 @@ side. Which prop fills
 which placement is shuffled per seed (`prop_order`), so each block's colour
 lands somewhere different in every tower.
 
+Blocks not in the tower lie flat at random spots on the table; there is no
+supply spot. Each episode picks the loose block nearest the tower whose ends
+are clear for the fingers (`choose_pick_block`), a rule the cameras can see.
+
 Real towers show seams: blocks differ slightly in shade, sit a fraction of a
 millimetre apart, and are never perfectly aligned. Every tower here has a
 small slot gap and per-block jitter for that reason, and `tower_props` gives
@@ -164,27 +168,25 @@ def scaled_block_dims(scale: float) -> dict[str, float]:
 
 
 @dataclass(frozen=True)
-class SupplyConfig:
-    """Where the next block waits to be picked up, lying flat, in world XY."""
-
-    region_min_xy_m: tuple[float, float] = (0.22, -0.20)
-    region_max_xy_m: tuple[float, float] = (0.34, -0.06)
-    yaw_range_deg: tuple[float, float] = (-90.0, 90.0)
-    support_z_m: float = 0.0
-    # The supply block keeps at least this much XY clearance from the tower's
-    # footprint so the gripper never brushes the tower while picking.
-    tower_clearance_m: float = 0.06
-
-
-@dataclass(frozen=True)
 class ScatterConfig:
-    """Blocks not in the tower lie flat at random spots on the table instead
-    of being parked out of view. The next block to place is one of them."""
+    """Where loose blocks lie on the table, and the rule for which one to
+    pick next. The region is in world XY."""
 
-    region_min_xy_m: tuple[float, float] = (0.12, -0.32)
-    region_max_xy_m: tuple[float, float] = (0.42, -0.04)
-    # Centre-to-centre spacing. None: the block's footprint diagonal plus 6 mm.
-    min_separation_m: float | None = None
+    region_min_xy_m: tuple[float, float] = (0.20, -0.40)
+    region_max_xy_m: tuple[float, float] = (0.60, 0.40)
+    # Clear space between any two loose blocks' footprints.
+    min_gap_m: float = 0.006
+    # Loose blocks stay this far outside the tower's footprint, so the hand
+    # placing a bottom-layer block never brushes them.
+    tower_clearance_m: float = 0.03
+    # Pick rule: blocks closer than this to the tower centre are skipped,
+    # leaving room for the whole hand beside the tower.
+    min_pick_distance_m: float = 0.13
+    # Pick rule: each end of the block needs this box clear for a finger:
+    # 10 mm between the block end and the G2's open pad (95 mm gap) plus an
+    # estimated 15 mm finger, by the 29.6 mm pad width plus 4 mm a side.
+    finger_clear_length_m: float = 0.025
+    finger_clear_width_m: float = 0.038
 
 
 @dataclass(frozen=True)
@@ -217,7 +219,8 @@ class EpisodeSpec:
     next_slot: SlotRef
     next_block: str
     next_slot_pose: Pose
-    supply_pose: Pose
+    # Where the next block lies on the table before the episode.
+    pick_pose: Pose
     # Set D: the last tower block starts here instead of its tower pose.
     misplaced_block: str | None = None
     misplaced_pose: Pose | None = None
@@ -225,8 +228,9 @@ class EpisodeSpec:
     failed_grasp_aim_xy_m: tuple[float, float] | None = None
     # Set C: start from a perturbed arm pose before capture.
     perturbed_start: bool = False
-    # Blocks not yet in the tower that lie on the table, by prop name.
-    scattered_poses: Mapping[str, Pose] = field(default_factory=dict)
+    # Every block not in the tower, lying on the table, by prop name; the
+    # next block is one of them.
+    loose_poses: Mapping[str, Pose] = field(default_factory=dict)
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -240,7 +244,7 @@ class EpisodeSpec:
                 "slot": self.next_slot.slot,
             },
             "next_slot_pose": _pose_json(self.next_slot_pose),
-            "supply_pose": _pose_json(self.supply_pose),
+            "pick_pose": _pose_json(self.pick_pose),
             "misplaced_block": self.misplaced_block,
             "misplaced_pose": (
                 _pose_json(self.misplaced_pose) if self.misplaced_pose else None
@@ -249,7 +253,7 @@ class EpisodeSpec:
                 list(self.failed_grasp_aim_xy_m) if self.failed_grasp_aim_xy_m else None
             ),
             "perturbed_start": self.perturbed_start,
-            "scattered_blocks": len(self.scattered_poses),
+            "loose_blocks": len(self.loose_poses),
         }
 
 
@@ -443,84 +447,161 @@ def tower_footprint_radius(config: TowerConfig) -> float:
 BLOCK_CLEARANCE_M = 0.0005
 
 
-def block_corners_xy(config: TowerConfig, pose: Pose) -> list[tuple[float, float]]:
-    """The four corners of a flat block's footprint in world XY."""
-    half_long, half_wide = config.block_length_m / 2.0, config.block_width_m / 2.0
-    x, y = pose.position[0], pose.position[1]
+def _rect_corners(
+    xy: Sequence[float], yaw_deg: float, length_m: float, width_m: float
+) -> list[tuple[float, float]]:
+    """The four corners of a rectangle centred at `xy`, long axis at `yaw_deg`."""
     corners = []
     for sx, sy in ((1.0, 1.0), (1.0, -1.0), (-1.0, -1.0), (-1.0, 1.0)):
-        dx, dy = _rotate_xy(sx * half_long, sy * half_wide, pose.yaw_deg)
-        corners.append((x + dx, y + dy))
+        dx, dy = _rotate_xy(sx * length_m / 2.0, sy * width_m / 2.0, yaw_deg)
+        corners.append((xy[0] + dx, xy[1] + dy))
     return corners
 
 
-def blocks_overlap(config: TowerConfig, a: Pose, b: Pose, margin_m: float = 0.0) -> bool:
-    """Whether two flat blocks' footprints overlap, or come within `margin_m`
-    of each other (separating-axis test on two rectangles)."""
-    corners_a, corners_b = block_corners_xy(config, a), block_corners_xy(config, b)
-    for yaw in (a.yaw_deg, b.yaw_deg):
-        for axis in (_rotate_xy(1.0, 0.0, yaw), _rotate_xy(0.0, 1.0, yaw)):
-            pa = [px * axis[0] + py * axis[1] for px, py in corners_a]
-            pb = [px * axis[0] + py * axis[1] for px, py in corners_b]
+def _rects_overlap(
+    a: Sequence[tuple[float, float]],
+    b: Sequence[tuple[float, float]],
+    margin_m: float = 0.0,
+) -> bool:
+    """Separating-axis test on two rectangles given by their corners: whether
+    they overlap or come within `margin_m` of each other."""
+    for corners in (a, b):
+        for i in range(2):
+            ex = corners[i + 1][0] - corners[i][0]
+            ey = corners[i + 1][1] - corners[i][1]
+            norm = math.hypot(ex, ey)
+            axis = (ex / norm, ey / norm)
+            pa = [px * axis[0] + py * axis[1] for px, py in a]
+            pb = [px * axis[0] + py * axis[1] for px, py in b]
             if max(pa) + margin_m <= min(pb) or max(pb) + margin_m <= min(pa):
                 return False
     return True
 
 
-def sample_supply_pose(
-    tower: TowerConfig, supply: SupplyConfig, seed: int, stream: str = "supply"
-) -> Pose:
-    """A flat supply-block pose inside the region, clear of the tower."""
-    reach = tower_footprint_radius(tower) + supply.tower_clearance_m
-    block_radius = math.hypot(tower.block_length_m, tower.block_width_m) / 2.0
-    for attempt in range(256):
-        rng = _rng(f"{stream}:{attempt}", seed)
-        yaw = rng.uniform(*supply.yaw_range_deg)
-        c, s = abs(math.cos(math.radians(yaw))), abs(math.sin(math.radians(yaw)))
-        half_x = (c * tower.block_length_m + s * tower.block_width_m) / 2.0
-        half_y = (s * tower.block_length_m + c * tower.block_width_m) / 2.0
-        lo_x, hi_x = supply.region_min_xy_m[0] + half_x, supply.region_max_xy_m[0] - half_x
-        lo_y, hi_y = supply.region_min_xy_m[1] + half_y, supply.region_max_xy_m[1] - half_y
-        if lo_x > hi_x or lo_y > hi_y:
-            raise ValueError("supply region cannot hold a block")
-        x, y = rng.uniform(lo_x, hi_x), rng.uniform(lo_y, hi_y)
-        if math.dist((x, y), tower.base_xy_m) >= reach + block_radius:
-            z = supply.support_z_m + tower.block_thickness_m / 2.0
-            return Pose((x, y, z), wrap_deg(yaw, 180.0))
-    raise ValueError("could not place the supply block clear of the tower")
+def block_corners_xy(config: TowerConfig, pose: Pose) -> list[tuple[float, float]]:
+    """The four corners of a flat block's footprint in world XY."""
+    return _rect_corners(
+        pose.position[:2], pose.yaw_deg, config.block_length_m, config.block_width_m
+    )
 
 
-def sample_scatter_poses(
-    tower: TowerConfig,
-    scatter: ScatterConfig,
-    seed: int,
-    names: Sequence[str],
-    occupied_xy: Sequence[tuple[float, float]],
-) -> dict[str, Pose]:
-    """Random flat poses for `names`, inside the region, apart from each
-    other, from every `occupied_xy` point, and clear of the tower. Blocks
-    that don't fit after many tries are left out (they stay parked)."""
-    rng = _rng("scatter", seed)
-    half = math.hypot(tower.block_length_m, tower.block_width_m) / 2.0
-    separation = scatter.min_separation_m or (2.0 * half + 0.006)
-    tower_reach = tower_footprint_radius(tower) + separation / 2.0
-    lo_x, lo_y = scatter.region_min_xy_m[0] + half, scatter.region_min_xy_m[1] + half
-    hi_x, hi_y = scatter.region_max_xy_m[0] - half, scatter.region_max_xy_m[1] - half
-    if lo_x > hi_x or lo_y > hi_y:
-        raise ValueError("scatter region cannot hold a block")
-    taken = list(occupied_xy)
-    poses: dict[str, Pose] = {}
+def blocks_overlap(config: TowerConfig, a: Pose, b: Pose, margin_m: float = 0.0) -> bool:
+    """Whether two flat blocks' footprints overlap, or come within `margin_m`
+    of each other."""
+    diagonal = math.hypot(config.block_length_m, config.block_width_m)
+    if math.dist(a.position[:2], b.position[:2]) > diagonal + margin_m:
+        return False  # too far apart to touch; skips the full test
+    return _rects_overlap(block_corners_xy(config, a), block_corners_xy(config, b), margin_m)
+
+
+def finger_zones(
+    config: TowerConfig, scatter: ScatterConfig, pose: Pose
+) -> list[list[tuple[float, float]]]:
+    """Where the open fingers come down for an end grip: a box beyond each end
+    of the block, along its long axis."""
+    reach = config.block_length_m / 2.0 + scatter.finger_clear_length_m / 2.0
+    zones = []
+    for sign in (1.0, -1.0):
+        dx, dy = _rotate_xy(sign * reach, 0.0, pose.yaw_deg)
+        centre = (pose.position[0] + dx, pose.position[1] + dy)
+        zones.append(
+            _rect_corners(
+                centre, pose.yaw_deg,
+                scatter.finger_clear_length_m, scatter.finger_clear_width_m,
+            )
+        )
+    return zones
+
+
+# A loose block counts as lying flat on the table within this height error;
+# one on its side or on another block sits 5 mm or more higher.
+FLAT_Z_TOLERANCE_M = 0.003
+
+
+def choose_pick_block(
+    config: TowerConfig, scatter: ScatterConfig, loose: Mapping[str, Pose]
+) -> str | None:
+    """The next block to pick: the loose block nearest the tower centre that
+    lies flat, is at least `min_pick_distance_m` from the tower centre, and has
+    both ends clear of every other loose block for the fingers. None if no
+    block qualifies.
+
+    The policy has no memory, so the choice must follow from what the cameras
+    show; ties go to the prop name so it is deterministic."""
+    flat_z = config.support_z_m + config.block_thickness_m / 2.0
+    footprints = {name: block_corners_xy(config, pose) for name, pose in loose.items()}
+    best: tuple[float, str] | None = None
+    for name, pose in loose.items():
+        if abs(pose.position[2] - flat_z) > FLAT_Z_TOLERANCE_M:
+            continue
+        distance = math.dist(pose.position[:2], config.base_xy_m)
+        if distance < scatter.min_pick_distance_m:
+            continue
+        zones = finger_zones(config, scatter, pose)
+        if any(
+            _rects_overlap(zone, corners)
+            for zone in zones
+            for other, corners in footprints.items()
+            if other != name
+        ):
+            continue
+        if best is None or (distance, name) < best:
+            best = (distance, name)
+    return None if best is None else best[1]
+
+
+# Each scatter layout gets this many draws per block, and each seed this many
+# layouts, before giving up.
+SCATTER_DRAWS_PER_BLOCK = 400
+SCATTER_LAYOUTS = 20
+
+
+def _scatter_once(
+    tower: TowerConfig, scatter: ScatterConfig, rng: random.Random, names: Sequence[str]
+) -> dict[str, Pose] | None:
+    lo_x, lo_y = scatter.region_min_xy_m
+    hi_x, hi_y = scatter.region_max_xy_m
+    half_diag = math.hypot(tower.block_length_m, tower.block_width_m) / 2.0
+    tower_reach = tower_footprint_radius(tower) + scatter.tower_clearance_m + half_diag
     z = tower.support_z_m + tower.block_thickness_m / 2.0
+    poses: dict[str, Pose] = {}
     for name in names:
-        for _attempt in range(200):
-            x, y = rng.uniform(lo_x, hi_x), rng.uniform(lo_y, hi_y)
-            if math.dist((x, y), tower.base_xy_m) < tower_reach + half:
+        for _draw in range(SCATTER_DRAWS_PER_BLOCK):
+            yaw = wrap_deg(rng.uniform(-90.0, 90.0), 180.0)
+            c, s = abs(math.cos(math.radians(yaw))), abs(math.sin(math.radians(yaw)))
+            half_x = (c * tower.block_length_m + s * tower.block_width_m) / 2.0
+            half_y = (s * tower.block_length_m + c * tower.block_width_m) / 2.0
+            if lo_x + half_x > hi_x - half_x or lo_y + half_y > hi_y - half_y:
+                raise ValueError("scatter region cannot hold a block")
+            x = rng.uniform(lo_x + half_x, hi_x - half_x)
+            y = rng.uniform(lo_y + half_y, hi_y - half_y)
+            if math.dist((x, y), tower.base_xy_m) < tower_reach:
                 continue
-            if all(math.dist((x, y), other) >= separation for other in taken):
-                poses[name] = Pose((x, y, z), wrap_deg(rng.uniform(-90.0, 90.0), 180.0))
-                taken.append((x, y))
+            pose = Pose((x, y, z), yaw)
+            if not any(
+                blocks_overlap(tower, pose, other, scatter.min_gap_m)
+                for other in poses.values()
+            ):
+                poses[name] = pose
                 break
+        else:
+            return None
     return poses
+
+
+def sample_loose_poses(
+    tower: TowerConfig, scatter: ScatterConfig, seed: int, names: Sequence[str]
+) -> dict[str, Pose]:
+    """Flat random poses on the table for every block in `names`: inside the
+    region, `min_gap_m` apart, clear of the tower, with at least one block
+    the pick rule accepts. Raises if the region can't hold them all."""
+    for layout in range(SCATTER_LAYOUTS):
+        poses = _scatter_once(tower, scatter, _rng(f"scatter:{layout}", seed), names)
+        if poses is not None and choose_pick_block(tower, scatter, poses) is not None:
+            return poses
+    raise ValueError(
+        f"could not lay {len(names)} loose blocks out in the scatter region; widen it"
+    )
 
 
 def sample_episode_set(seed: int, weights: Mapping[str, float]) -> str:
@@ -565,27 +646,32 @@ def _misplaced(
     return Pose((x + dx, y + dy, z), target.yaw_deg)
 
 
+def sample_tower_height(tower: TowerConfig, seed: int, episode_set: str) -> int:
+    """Blocks already placed, uniform over 0..block_count-1 (from 1 for set D)."""
+    low = 1 if episode_set == "D" else 0
+    return _rng("tower-height", seed).randint(low, tower.block_count - 1)
+
+
 def build_episode_spec(
     seed: int,
     tower: TowerConfig,
-    supply: SupplyConfig,
+    scatter: ScatterConfig = ScatterConfig(),
     sampling: EpisodeSamplingConfig = EpisodeSamplingConfig(),
     *,
     episode_set: str | None = None,
     placed_count: int | None = None,
-    scatter: ScatterConfig | None = None,
 ) -> EpisodeSpec:
     """Decide one episode from its seed.
 
     Tower height is uniform over 0..block_count-1, so every slot is the next
     slot equally often and the top layers get as much data as the bottom.
-    Set D needs a block to misplace, so it never starts from an empty tower."""
+    Set D needs a block to misplace, so it never starts from an empty tower.
+    Every block not in the tower is scattered on the table."""
     chosen = episode_set or sample_episode_set(seed, sampling.set_weights)
     if chosen not in EPISODE_SETS:
         raise ValueError(f"unknown episode set {chosen!r}")
     if placed_count is None:
-        low = 1 if chosen == "D" else 0
-        placed_count = _rng("tower-height", seed).randint(low, tower.block_count - 1)
+        placed_count = sample_tower_height(tower, seed, chosen)
     if not 0 <= placed_count < tower.block_count:
         raise ValueError(f"placed_count {placed_count} leaves no slot to fill")
     if chosen == "D" and placed_count == 0:
@@ -596,7 +682,10 @@ def build_episode_spec(
     names = prop_order(tower, seed)
     poses = tower_poses(tower, seed, placed_count, drifted, names)
     ref = slot_ref(tower, placed_count)
-    supply_pose = sample_supply_pose(tower, supply, seed)
+    loose = sample_loose_poses(tower, scatter, seed, names[placed_count:])
+    next_block = choose_pick_block(tower, scatter, loose)
+    assert next_block is not None  # sample_loose_poses guarantees one
+    pick_pose = loose[next_block]
 
     misplaced_block = misplaced_pose = None
     if chosen == "D":
@@ -616,17 +705,9 @@ def build_episode_spec(
         distance = rng.uniform(*sampling.regrasp_offset_range_m)
         heading = rng.uniform(0.0, 2.0 * math.pi)
         failed_aim = (
-            supply_pose.position[0] + distance * math.cos(heading),
-            supply_pose.position[1] + distance * math.sin(heading),
+            pick_pose.position[0] + distance * math.cos(heading),
+            pick_pose.position[1] + distance * math.sin(heading),
         )
-
-    scattered: dict[str, Pose] = {}
-    if scatter is not None:
-        unused = names[placed_count + 1:]
-        avoid = [supply_pose.position[:2]]
-        if failed_aim is not None:
-            avoid.append(failed_aim)
-        scattered = sample_scatter_poses(tower, scatter, seed, unused, avoid)
 
     return EpisodeSpec(
         seed=int(seed),
@@ -634,14 +715,43 @@ def build_episode_spec(
         placed_count=placed_count,
         tower_poses=poses,
         next_slot=ref,
-        next_block=names[placed_count],
+        next_block=next_block,
         next_slot_pose=next_slot_target(tower, seed, placed_count, drifted),
-        supply_pose=supply_pose,
+        pick_pose=pick_pose,
         misplaced_block=misplaced_block,
         misplaced_pose=misplaced_pose,
         failed_grasp_aim_xy_m=failed_aim,
         perturbed_start=chosen == "C",
-        scattered_poses=scattered,
+        loose_poses=loose,
+    )
+
+
+def chain_step_spec(
+    seed: int,
+    tower: TowerConfig,
+    scatter: ScatterConfig,
+    tower_names: Sequence[str],
+    loose: Mapping[str, Pose],
+) -> EpisodeSpec | None:
+    """The next step of a chained build (set F), from the tower built so far
+    (prop names in placement order) and where the loose blocks lie now. The
+    loose blocks stay where they are. None if no loose block can be picked."""
+    placed_count = len(tower_names)
+    if placed_count >= tower.block_count:
+        raise ValueError("the tower is already complete")
+    next_block = choose_pick_block(tower, scatter, loose)
+    if next_block is None:
+        return None
+    return EpisodeSpec(
+        seed=int(seed),
+        episode_set="F",
+        placed_count=placed_count,
+        tower_poses=tower_poses(tower, seed, placed_count, False, tower_names),
+        next_slot=slot_ref(tower, placed_count),
+        next_block=next_block,
+        next_slot_pose=next_slot_target(tower, seed, placed_count, False),
+        pick_pose=loose[next_block],
+        loose_poses=dict(loose),
     )
 
 

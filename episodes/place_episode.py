@@ -1,9 +1,10 @@
 """
 Run scripted Jenga placement episodes through normal Viam APIs.
 
-One episode places one block: reset the tower, pick the next block from the
-supply region, carry it above its slot, lower and release it, adjust it if it
-landed off target, and retreat. Like `oracle_episode.py`, this is an oracle: it
+One episode places one block: reset the tower and scatter the loose blocks on
+the table, pick the loose block nearest the tower whose ends are clear, carry
+it above its slot, lower and release it, adjust it if it landed off target,
+and retreat. Like `oracle_episode.py`, this is an oracle: it
 plans from exact sim poses.
 
 Training data cannot mask frames, so every deliberate error happens before
@@ -12,7 +13,18 @@ capture starts and only the recovery is recorded:
   D  the last tower block starts misplaced; the episode straightens it first,
   E  the arm starts hovering empty, as after a missed grasp, beside the block.
 Set F (`--chain`) builds a whole tower without resets, keeping the oracle's own
-small errors.
+small errors; loose blocks stay where they lie between steps.
+
+Each episode is recorded with one prompt for the whole placement (`--task`)
+and a prompt per stage (pick, carry, lower, ...) through `mark_episode_stage`.
+A stage needs at least one 33-frame action chunk to yield a training sample;
+the sim module holds a shorter stage open (the arm waits) until it has one,
+so the carry and retreat moves alone last that long and the arm rarely waits.
+
+About half the episodes (`--nudge-fraction`) are nudged with the pick recipe
+that trained our best policy (dn-best-1): the sim pushes the arm off its
+commanded joints and records the clean targets. The gripper is only ever
+opened or closed.
 
 The tower blocks must exist as props in the sim world config; print them with
 `--print-props`.
@@ -56,6 +68,7 @@ if not __package__:
 
 if __package__:
     from . import jenga_tower as jt
+    from .batch_episodes import _nudge_deg
     from .oracle_episode import (
         APPROACH_WAYPOINT_MIN_DURATION_SEC,
         CENTER_MOVE_CONSTRAINTS,
@@ -81,6 +94,7 @@ if __package__:
     )
 else:
     import jenga_tower as jt
+    from batch_episodes import _nudge_deg
     from oracle_episode import (
         APPROACH_WAYPOINT_MIN_DURATION_SEC,
         CENTER_MOVE_CONSTRAINTS,
@@ -114,8 +128,8 @@ GRIPPER_MODEL = "xarm_gripper_g2"
 # oracle's default home is the Lite6's, whose joint 3 (+90 deg) is outside the
 # 850's range.
 UF850_HOME_JOINT_DEGREES = (0.0, 22.57, -50.69, 0.04, -74.04, -0.04)
-# Phase labels for the result record. Capture uses one "base" stage, as the
-# pick oracle does, so these are not written into the episode.
+# Stage prompts, written into the episode with mark_episode_stage and listed
+# in the result record.
 STAGE_STRAIGHTEN = "straighten the top block of the tower"
 STAGE_PICK = "pick up the next block"
 STAGE_CARRY = "carry the block above its slot on the tower"
@@ -123,6 +137,12 @@ STAGE_LOWER = "lower the block into its slot and open the gripper"
 STAGE_ADJUST = "adjust the block into its slot"
 STAGE_RETREAT = "lift the gripper away from the tower"
 STAGE_HOLD = "hold still"
+# The nudges of the pick recipe that trained dn-best-1 (cosmos-spike
+# sim-tools/record_all.sh), used in about half the episodes.
+DN_BEST_NUDGE_DEG = (2.5, 3.3, 2.9, 1.5, 3.2, 5.0)
+DN_BEST_NUDGE_INTERVAL_SEC = 1.2
+DN_BEST_NUDGE_DURATION_SEC = 0.6
+DN_BEST_NUDGE_FRACTION = 0.5
 
 # Tower reset: blocks are set this far above their rest height per layer so
 # they never start interpenetrating, then allowed to settle.
@@ -263,6 +283,9 @@ class _Episode:
         self.timer = _PhaseTimer()
         self.capturing = False
         self.phases: list[str] = []
+        # The stage being recorded, and every stage with its first frame.
+        self.stage: str | None = None
+        self.stages: list[dict[str, Any]] = []
 
     async def read_pose(self, prop: str) -> jt.Pose:
         reading = await self.world.do_command({"command": "get_prop_pose", "prop": prop})
@@ -271,11 +294,26 @@ class _Episode:
     async def read_poses(self, props: Sequence[str]) -> dict[str, jt.Pose]:
         return {name: await self.read_pose(name) for name in props}
 
-    async def mark(self, phase: str) -> None:
-        """Record that a phase began. Capture keeps the oracle's single base
-        stage, so this only feeds the result record."""
-        if phase not in self.phases:
-            self.phases.append(phase)
+    async def begin_capture(self, command: Mapping[str, Any], stage: str) -> None:
+        """Start capture with `stage` as its first stage, at frame 0."""
+        await _start_episode_capture(self.world, command, stage)
+        self.capturing = True
+        self.stage = stage
+        self.stages.append({"task": stage, "start_frame": 0})
+        if stage not in self.phases:
+            self.phases.append(stage)
+
+    async def mark(self, stage: str) -> None:
+        """Begin a stage: list it in the result and, while capturing, write it
+        into the episode. The sim module holds the previous stage open until
+        it has one action chunk of frames."""
+        if stage not in self.phases:
+            self.phases.append(stage)
+        if not self.capturing or stage == self.stage:
+            return
+        reply = await self.world.do_command({"command": "mark_episode_stage", "task": stage})
+        self.stage = stage
+        self.stages.append({"task": stage, "start_frame": reply.get("start_frame")})
 
     async def go(
         self,
@@ -339,7 +377,13 @@ class _Episode:
         return pose.x / 1000.0, pose.y / 1000.0, pose.z / 1000.0, -pose.theta
 
     async def transit(
-        self, label: str, x: float, y: float, yaw: float, clear_z: float
+        self,
+        label: str,
+        x: float,
+        y: float,
+        yaw: float,
+        clear_z: float,
+        cross_min_sec: float = APPROACH_WAYPOINT_MIN_DURATION_SEC,
     ) -> float:
         """Rise straight up to at least `clear_z`, then cross at that height to
         above (x, y). The tower is not an obstacle in the motion planner's
@@ -352,8 +396,7 @@ class _Episode:
                 LINEAR_PICK_CONSTRAINTS, APPROACH_WAYPOINT_MIN_DURATION_SEC,
             )
         await self.go(
-            f"{label}-cross", x, y, height, yaw,
-            LINEAR_PICK_CONSTRAINTS, APPROACH_WAYPOINT_MIN_DURATION_SEC,
+            f"{label}-cross", x, y, height, yaw, LINEAR_PICK_CONSTRAINTS, cross_min_sec
         )
         return height
 
@@ -453,17 +496,15 @@ async def reset_tower(
     tower: jt.TowerConfig,
     spec: jt.EpisodeSpec,
 ) -> dict[str, Any]:
-    """Pause, place the tower and the supply block, park every other block,
-    let physics settle, and check nothing moved. Returns the settled poses
-    and whether the tower is stable."""
+    """Pause, place the tower, lay the loose blocks on the table, park any
+    other block, let physics settle, and check the tower stood. Returns the
+    settled poses and whether the tower is stable."""
     await world.do_command({"command": "pause"})
     try:
         unused = [
             name
             for name in tower.block_names()
-            if name not in spec.tower_poses
-            and name != spec.next_block
-            and name not in spec.scattered_poses
+            if name not in spec.tower_poses and name not in spec.loose_poses
         ]
         if unused:
             await world.do_command({"command": "park_props", "props": unused})
@@ -481,8 +522,7 @@ async def reset_tower(
                 pose.yaw_deg,
             )
             await world.do_command(lifted.as_prop_command(name))
-        await world.do_command(spec.supply_pose.as_prop_command(spec.next_block))
-        for name, pose in spec.scattered_poses.items():
+        for name, pose in spec.loose_poses.items():
             await world.do_command(pose.as_prop_command(name))
     finally:
         await world.do_command({"command": "play"})
@@ -506,12 +546,34 @@ async def reset_tower(
     return {"stable": not unstable, "unstable_blocks": unstable, "poses": settled}
 
 
-async def prepare_supply_only(
-    world: Any, spec: jt.EpisodeSpec
-) -> None:
-    """Chained builds keep the tower as it stands; only the next block moves."""
-    await world.do_command(spec.supply_pose.as_prop_command(spec.next_block))
-    await _wait_sim_duration(world, RESET_SETTLE_SEC / 2.0)
+async def read_loose_poses(world: Any, names: Sequence[str]) -> dict[str, jt.Pose]:
+    """Where the loose blocks lie now, for the next step of a chained build."""
+    poses = {}
+    for name in names:
+        reading = await world.do_command({"command": "get_prop_pose", "prop": name})
+        poses[name] = _pose_from_reading(reading)
+    return poses
+
+
+def episode_nudge(
+    key: str,
+    fraction: float,
+    amplitude_deg: float | Sequence[float],
+    interval_sec: float,
+    duration_sec: float,
+) -> dict[str, Any] | None:
+    """The start_episode nudge for one episode, or None: a fixed share of
+    episodes, chosen by `key` (seed and step) so reruns nudge the same ones."""
+    amplitudes = amplitude_deg if isinstance(amplitude_deg, Sequence) else [amplitude_deg]
+    if not max(amplitudes) or random.Random(f"nudge:{key}").random() >= fraction:
+        return None
+    return {
+        "amplitude_deg": (
+            list(amplitude_deg) if isinstance(amplitude_deg, Sequence) else amplitude_deg
+        ),
+        "interval_s": interval_sec,
+        "duration_s": duration_sec,
+    }
 
 
 async def execute_place(
@@ -532,9 +594,13 @@ async def execute_place(
     task: str = DEFAULT_PROMPT,
     reset: bool = True,
     home_joint_degrees: Sequence[float] = UF850_HOME_JOINT_DEGREES,
+    nudge: Mapping[str, Any] | None = None,
+    upload: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run one placement episode from `spec`. With `reset=False` (chained
-    builds) the tower is left as it stands."""
+    builds) the tower and the loose blocks are left as they lie. `nudge` and
+    `upload` go to start_episode and stop_episode as the pick oracle sends
+    them."""
     ep = _Episode(world, arm, gripper, motion, names, grasp)
     sim_clock = await _ElapsedClock.start(world, "episode")
     result: dict[str, Any] = {"spec": spec.summary(), "outcome": "incomplete"}
@@ -552,12 +618,10 @@ async def execute_place(
         if not reset_report["stable"]:
             result["outcome"] = "reset_unstable"
             return result
-    else:
-        await prepare_supply_only(world, spec)
 
     tower_names = list(spec.tower_poses)
     before = await ep.read_poses(tower_names)
-    supply = await ep.read_pose(spec.next_block)
+    block = await ep.read_pose(spec.next_block)
     # Empty-handed TCP height that clears the tower by the carry clearance,
     # with a block thickness of margin for the fingertips below the TCP.
     tower_top = jt.tower_top_z(tower, spec.placed_count)
@@ -586,8 +650,8 @@ async def execute_place(
             await _move(motion, names.gripper, moved, constraints=CENTER_MOVE_CONSTRAINTS)
     if spec.failed_grasp_aim_xy_m is not None:
         ax, ay = spec.failed_grasp_aim_xy_m
-        hover_z = supply.position[2] + grasp.grasp_z_offset_m + grasp.lift_height_m
-        aim_yaw = tool_yaw_deg(supply.yaw_deg, grasp)
+        hover_z = block.position[2] + grasp.grasp_z_offset_m + grasp.lift_height_m
+        aim_yaw = tool_yaw_deg(block.yaw_deg, grasp)
         with ep.timer.phase("failed_grasp_start"):
             await ep.transit("failed-grasp", ax, ay, aim_yaw, clear_z)
             await ep.go(
@@ -610,13 +674,16 @@ async def execute_place(
             "cosmos_output_dir": cosmos_output_dir,
             "target": {
                 "prop_name": spec.next_block,
-                "position_m": list(supply.position),
-                "rotation_wxyz": list(supply.orientation_wxyz),
+                "position_m": list(block.position),
+                "rotation_wxyz": list(block.orientation_wxyz),
             },
         }
+        if nudge is not None:
+            start_command["nudge"] = dict(nudge)
+        first_stage = STAGE_STRAIGHTEN if spec.misplaced_block is not None else STAGE_PICK
         with ep.timer.phase("capture_start"):
-            await _start_episode_capture(world, start_command)
-        ep.capturing = True
+            await ep.begin_capture(start_command, first_stage)
+    result["nudge"] = dict(nudge) if nudge is not None and ep.capturing else None
 
     capture = None
     adjustments: list[dict[str, Any]] = []
@@ -633,12 +700,12 @@ async def execute_place(
             before[spec.misplaced_block] = straightened
 
         await ep.mark(STAGE_PICK)
-        reported = await ep.pick(supply, "pick", clear_z, carry_estimate_z)
+        reported = await ep.pick(block, "pick", clear_z, carry_estimate_z)
         tcp_x, tcp_y, tcp_z, pick_yaw = await ep.tcp()
         lifted = await ep.read_pose(spec.next_block)
         # The sim's own block pose decides whether the grasp worked; the
         # gripper's firm-grasp flag can miss a flat block it is holding.
-        holding = lifted.position[2] - supply.position[2] >= MIN_LIFT_TO_COUNT_AS_HELD_M
+        holding = lifted.position[2] - block.position[2] >= MIN_LIFT_TO_COUNT_AS_HELD_M
         result["holding_after_lift"] = holding
         result["gripper_reported_holding"] = reported
         if not holding:
@@ -666,7 +733,9 @@ async def execute_place(
         release_z = sz + grasp.release_clearance_m + tcp_above_center
 
         await ep.mark(STAGE_CARRY)
-        await ep.transit("carry", sx, sy, yaw, carry_z)
+        await ep.transit(
+            "carry", sx, sy, yaw, carry_z, cross_min_sec=MIN_SUBTASK_DURATION_SEC
+        )
         await ep.mark(STAGE_LOWER)
         pre_x, pre_y, pre_yaw = sx, sy, yaw
         if spec.perturbed_start:
@@ -728,15 +797,19 @@ async def execute_place(
             result["failure"] = "disturbed" if moved else "placement"
     finally:
         if ep.capturing:
+            stop_command: dict[str, Any] = {
+                "command": "stop_episode", "outcome": result["outcome"],
+            }
+            if upload is not None:
+                stop_command["upload"] = dict(upload)
             with ep.timer.phase("capture_stop"):
-                capture = await _stop_episode_capture(
-                    world, {"command": "stop_episode", "outcome": result["outcome"]}
-                )
+                capture = await _stop_episode_capture(world, stop_command)
         timing = ep.timer.summary()
         timing["sim_elapsed_sec"] = (
             await sim_clock.elapsed(check_playing=False) if sim_clock.simulated else None
         )
         result["phases"] = list(ep.phases)
+        result["stages"] = list(ep.stages)
         result["capture"] = capture
         result["timing"] = timing
     return result
@@ -815,10 +888,9 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--placed", type=int, help="force the starting tower size")
     parser.add_argument(
-        "--scatter", action="store_true",
-        help="lay blocks not in the tower at random spots on the table instead of parking them",
+        "--scatter-min-xy", type=_xy, default=jt.ScatterConfig.region_min_xy_m,
+        help="corner X,Y of the table region the loose blocks lie in, in the arm base frame (m)",
     )
-    parser.add_argument("--scatter-min-xy", type=_xy, default=jt.ScatterConfig.region_min_xy_m, help="scatter region corner X,Y (world, m)")
     parser.add_argument("--scatter-max-xy", type=_xy, default=jt.ScatterConfig.region_max_xy_m)
     parser.add_argument("--chain", action="store_true", help="set F: build whole towers without resets")
     parser.add_argument("--layers", type=int, default=jt.TowerConfig.layers)
@@ -832,8 +904,6 @@ def _parser() -> argparse.ArgumentParser:
         "--slot-gap-m", type=float, default=jt.TowerConfig.slot_gap_m,
         help="extra spacing between blocks in a layer, e.g. room for a side-grip finger",
     )
-    parser.add_argument("--supply-min-xy", type=_xy, default=jt.SupplyConfig.region_min_xy_m, help="supply region corner X,Y in the arm base frame (m)")
-    parser.add_argument("--supply-max-xy", type=_xy, default=jt.SupplyConfig.region_max_xy_m)
     parser.add_argument("--grasp-axis", choices=("end", "side"), default="end")
     parser.add_argument(
         "--jaw-yaw-offset-deg", type=float, default=GraspConfig.jaw_yaw_offset_deg,
@@ -853,6 +923,26 @@ def _parser() -> argparse.ArgumentParser:
         "--episode-timeout-sec", type=float, default=0.0,
         help="end an episode that runs longer than this (0: no limit); it is recorded as an error",
     )
+    parser.add_argument(
+        "--nudge-fraction", type=float, default=DN_BEST_NUDGE_FRACTION,
+        help="share of episodes that are nudged (0: none), chosen per seed",
+    )
+    parser.add_argument(
+        "--nudge-deg", type=_nudge_deg, default=list(DN_BEST_NUDGE_DEG),
+        help="nudge amplitude per joint in degrees: one value or six comma-separated "
+        "(default: the dn-best-1 pick recipe)",
+    )
+    parser.add_argument("--nudge-interval-sec", type=float, default=DN_BEST_NUDGE_INTERVAL_SEC)
+    parser.add_argument("--nudge-duration-sec", type=float, default=DN_BEST_NUDGE_DURATION_SEC)
+    parser.add_argument(
+        "--upload-dataset-id",
+        help="have the machine upload each recorded episode to this Viam dataset",
+    )
+    parser.add_argument(
+        "--upload-tag", action="append", default=[],
+        help="extra tag for uploaded episodes; may be repeated",
+    )
+    parser.add_argument("--app-url", help="Viam app host the machine uploads to (default: app.viam.com)")
     parser.add_argument("--task", default=DEFAULT_PROMPT)
     parser.add_argument("--world", default=MachineNames.world)
     parser.add_argument("--arm", default=MachineNames.arm)
@@ -901,66 +991,44 @@ async def _run(args: argparse.Namespace) -> int:
             args.address, viam_config_path=args.viam_config, disable_webrtc=args.disable_webrtc
         ) as machine:
             tower_xy = await arm_to_world_xy(machine, names.arm, *args.tower_xy)
-            supply_corners = [
+            scatter_corners = [
                 await arm_to_world_xy(machine, names.arm, x, y)
-                for x in (args.supply_min_xy[0], args.supply_max_xy[0])
-                for y in (args.supply_min_xy[1], args.supply_max_xy[1])
+                for x in (args.scatter_min_xy[0], args.scatter_max_xy[0])
+                for y in (args.scatter_min_xy[1], args.scatter_max_xy[1])
             ]
-            xs, ys = zip(*supply_corners)
+            xs, ys = zip(*scatter_corners)
             tower = jt.TowerConfig(
                 base_xy_m=tower_xy, base_yaw_deg=args.tower_yaw_deg, layers=args.layers,
                 arm_xy_m=await arm_to_world_xy(machine, names.arm, 0.0, 0.0),
                 slot_gap_m=args.slot_gap_m, **jt.scaled_block_dims(args.block_scale),
             )
-            supply = jt.SupplyConfig(
+            scatter = jt.ScatterConfig(
                 region_min_xy_m=(min(xs), min(ys)), region_max_xy_m=(max(xs), max(ys))
-            )
-            scatter = (
-                jt.ScatterConfig(region_min_xy_m=args.scatter_min_xy, region_max_xy_m=args.scatter_max_xy)
-                if args.scatter else None
             )
             world = Generic.from_robot(machine, names.world)
             gripper = Gripper.from_robot(machine, names.gripper)
             motion = MotionClient.from_robot(machine, names.motion)
             arm = Arm.from_robot(machine, names.arm)
-
-            # Each group runs in order and stops at its first failure: a single
-            # episode, or one chained tower (set F) built without resets.
-            groups: list[list[tuple[jt.EpisodeSpec, str, bool]]] = []
-            for seed in range(args.seed, args.seed + args.count):
-                if args.chain:
-                    first = args.placed or 0
-                    chain = []
-                    for k in range(first, tower.block_count):
-                        spec = jt.build_episode_spec(
-                            seed, tower, supply, episode_set="F", placed_count=k
-                        )
-                        # Each chained step gets its own supply pose.
-                        spec = replace(
-                            spec,
-                            supply_pose=jt.sample_supply_pose(
-                                tower, supply, seed, f"supply-chain-{k}"
-                            ),
-                        )
-                        chain.append((spec, f"chain{seed:06d}-{k:02d}", k == first))
-                    groups.append(chain)
-                else:
-                    spec = jt.build_episode_spec(
-                        seed, tower, supply,
-                        episode_set=args.episode_set, placed_count=args.placed,
-                        scatter=scatter,
-                    )
-                    groups.append([(spec, f"{seed:06d}", True)])
-
-            jobs = [job for group in groups for job in group]
             episode_dir = args.episode_dir or (
                 str(args.run_dir / "episodes") if args.run_dir else None
             )
-            skip_until_reset = False
-            for spec, episode_id, reset in jobs:
-                if skip_until_reset and not reset:
-                    continue
-                skip_until_reset = False
+            upload = None
+            if args.upload_dataset_id:
+                tags = ["isaac-episode", "jenga-place"]
+                if args.run_dir is not None:
+                    tags.insert(0, args.run_dir.name)
+                upload = {"dataset_id": args.upload_dataset_id, "tags": [*tags, *args.upload_tag]}
+                if args.app_url:
+                    upload["app_url"] = args.app_url
+
+            def emit(record: dict[str, Any]) -> None:
+                line = json.dumps(record, sort_keys=True, default=str)
+                print(line, flush=True)
+                if results_file is not None:
+                    results_file.write(line + "\n")
+                    results_file.flush()
+
+            async def run(spec: jt.EpisodeSpec, episode_id: str, reset: bool) -> dict[str, Any]:
                 result = await run_episode_safely(
                     world, gripper, motion, arm, spec, tower,
                     timeout_sec=args.episode_timeout_sec,
@@ -972,22 +1040,57 @@ async def _run(args: argparse.Namespace) -> int:
                         if episode_dir and args.cosmos_output else None
                     ),
                     episode_id=episode_id,
+                    nudge=episode_nudge(
+                        episode_id, args.nudge_fraction, args.nudge_deg,
+                        args.nudge_interval_sec, args.nudge_duration_sec,
+                    ),
+                    upload=upload,
                 )
                 result["episode_id"] = episode_id
                 result["embodiment"] = {"arm_model": ARM_MODEL, "gripper_model": GRIPPER_MODEL}
-                line = json.dumps(result, sort_keys=True, default=str)
-                print(line, flush=True)
-                if results_file is not None:
-                    results_file.write(line + "\n")
-                    results_file.flush()
-                if result["outcome"] == "reset_unstable":
-                    # Not the oracle's failure: the starting tower didn't stand.
-                    skip_until_reset = args.chain
-                elif result["outcome"] != "success":
-                    failures += 1
-                    # A chained tower can't continue from a failed step; move
-                    # on to the next tower, which starts with a reset.
-                    skip_until_reset = args.chain
+                emit(result)
+                return result
+
+            for seed in range(args.seed, args.seed + args.count):
+                if not args.chain:
+                    spec = jt.build_episode_spec(
+                        seed, tower, scatter,
+                        episode_set=args.episode_set, placed_count=args.placed,
+                    )
+                    result = await run(spec, f"{seed:06d}", True)
+                    # A tower that didn't stand at reset is not the oracle's failure.
+                    if result["outcome"] not in ("success", "reset_unstable"):
+                        failures += 1
+                    continue
+                # Set F: one tower, built step by step without resets. Each
+                # step picks from where the loose blocks lie after the last.
+                spec = jt.build_episode_spec(
+                    seed, tower, scatter, episode_set="F", placed_count=args.placed or 0
+                )
+                built = list(spec.tower_poses)
+                reset = True
+                while True:
+                    k = spec.placed_count
+                    result = await run(spec, f"chain{seed:06d}-{k:02d}", reset)
+                    if result["outcome"] != "success":
+                        # A chained tower can't continue from a failed step.
+                        if result["outcome"] != "reset_unstable":
+                            failures += 1
+                        break
+                    built.append(spec.next_block)
+                    if len(built) == tower.block_count:
+                        break
+                    loose_names = [n for n in spec.loose_poses if n != spec.next_block]
+                    loose = await read_loose_poses(world, loose_names)
+                    next_spec = jt.chain_step_spec(seed, tower, scatter, built, loose)
+                    if next_spec is None:
+                        failures += 1
+                        emit({
+                            "episode_id": f"chain{seed:06d}-{len(built):02d}",
+                            "outcome": "failure", "failure": "no_clear_block",
+                        })
+                        break
+                    spec, reset = next_spec, False
     finally:
         if results_file is not None:
             results_file.close()
@@ -1009,6 +1112,10 @@ def main() -> int:
         parser.error("--count must be at least 1")
     if args.chain and args.episode_set not in (None, "F"):
         parser.error("--chain always runs set F")
+    if not 0.0 <= args.nudge_fraction <= 1.0:
+        parser.error("--nudge-fraction must be between 0 and 1")
+    if args.nudge_interval_sec <= 0 or args.nudge_duration_sec <= 0:
+        parser.error("--nudge-interval-sec and --nudge-duration-sec must be positive")
     return asyncio.run(_run(args))
 
 
