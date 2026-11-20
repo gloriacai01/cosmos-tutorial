@@ -16,7 +16,7 @@ import jenga_tower as jt
 import place_episode as pe
 
 TOWER = jt.TowerConfig(layers=3)
-SUPPLY = jt.SupplyConfig()
+SCATTER = jt.ScatterConfig()
 
 
 class FakeSim:
@@ -33,6 +33,8 @@ class FakeSim:
         self.held: tuple[str, tuple[float, float, float], float] | None = None
         self.planned: tuple[tuple[float, float, float], float] | None = None
         self.stages: list[str] = []
+        self.start_command: dict | None = None
+        self.stop_command: dict | None = None
         self.capturing = False
         self.reset_drift: dict[str, tuple[float, float]] = {}
         # Where the block ends up in the hand relative to where it was aimed:
@@ -47,6 +49,7 @@ class FakeSim:
         # Make the n-th streamed move raise, as a dropped connection would.
         self.fail_on_move: int | None = None
         self.moves: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
+        self.nudge_calls: list[tuple[str | None, bool]] = []
 
     # -- world ---------------------------------------------------------
     async def do_command(self, command):
@@ -80,12 +83,20 @@ class FakeSim:
             }
         if cmd == "start_episode":
             self.capturing = True
+            self.start_command = dict(command)
+            self.capture_started = self.sim_time
             return {}
+        if cmd == "set_nudge_paused":
+            # (stage being recorded, paused) per call; a nudge is always mid-way.
+            self.nudge_calls.append((self.stages[-1] if self.stages else None, command["paused"]))
+            return {"nudging": True, "paused": command["paused"], "remaining_s": 0.3}
         if cmd == "mark_episode_stage":
             self.stages.append(command["task"])
-            return {}
+            frame = round((self.sim_time - self.capture_started) * 15)
+            return {"start_frame": frame, "task": command["task"]}
         if cmd == "stop_episode":
             self.capturing = False
+            self.stop_command = dict(command)
             return {"outcome": command["outcome"]}
         raise AssertionError(f"unexpected world command {cmd}")
 
@@ -139,8 +150,9 @@ class FakeSim:
         return {"max_velocity_rad_s": [3.0] * 6, "max_acceleration_rad_s2": [10.0] * 6}
 
     async def stream(self, batches):
-        async for _ in batches:
-            pass
+        async for batch in batches:
+            # The arm takes the trajectory's planned time on the sim clock.
+            self.sim_time += batch[-1].time.total_seconds()
         if self.fail_on_move is not None and len(self.moves) >= self.fail_on_move:
             raise RuntimeError("stream dropped")
         assert self.planned is not None
@@ -224,15 +236,17 @@ def _run(sim, spec, **kwargs):
 @pytest.mark.parametrize("placed", [0, 2, 3, 7])
 def test_clean_placement_lands_in_its_slot(placed):
     sim = FakeSim(TOWER)
-    spec = jt.build_episode_spec(1, TOWER, SUPPLY, episode_set="A", placed_count=placed)
+    spec = jt.build_episode_spec(1, TOWER, SCATTER, episode_set="A", placed_count=placed)
     result = _run(sim, spec)
     assert result["outcome"] == "success", result
     assert result["placement_error"]["xy_m"] < 1e-6
     assert result["placement_error"]["z_m"] < 1e-6
     assert result["disturbed_blocks"] == []
-    assert result["phases"] == [pe.STAGE_PICK, pe.STAGE_CARRY, pe.STAGE_LOWER, pe.STAGE_RETREAT, pe.STAGE_HOLD]
-    # Capture records one base stage, like the pick oracle.
-    assert sim.stages == ["base"]
+    stages = [pe.STAGE_PICK, pe.STAGE_CARRY, pe.STAGE_LOWER, pe.STAGE_RETREAT, pe.STAGE_HOLD]
+    assert result["phases"] == stages
+    # Each stage is written into the episode, starting with the first frame.
+    assert sim.stages == stages
+    assert result["stages"][0] == {"task": pe.STAGE_PICK, "start_frame": 0}
     assert not sim.capturing
 
 
@@ -241,7 +255,7 @@ def test_sideways_moves_only_happen_above_the_tower(episode_set):
     """The tower is not an obstacle in the planner's world, so any move that
     travels sideways must start and end above the tower top."""
     sim = FakeSim(TOWER)
-    spec = jt.build_episode_spec(8, TOWER, SUPPLY, episode_set=episode_set, placed_count=7)
+    spec = jt.build_episode_spec(8, TOWER, SCATTER, episode_set=episode_set, placed_count=7)
     result = _run(sim, spec)
     assert result["outcome"] == "success", result
     safe_z = jt.tower_top_z(TOWER, spec.placed_count) + TOWER.block_thickness_m
@@ -253,7 +267,7 @@ def test_sideways_moves_only_happen_above_the_tower(episode_set):
 def test_release_corrects_for_where_the_block_sits_in_the_hand():
     sim = FakeSim(TOWER)
     sim.grasp_slip = (0.004, -0.002, 3.0)
-    spec = jt.build_episode_spec(1, TOWER, SUPPLY, episode_set="A", placed_count=4)
+    spec = jt.build_episode_spec(1, TOWER, SCATTER, episode_set="A", placed_count=4)
     result = _run(sim, spec)
     assert result["outcome"] == "success", result
     assert result["adjustments"] == []
@@ -266,7 +280,7 @@ def test_release_corrects_for_where_the_block_sits_in_the_hand():
 def test_held_block_counts_even_when_the_gripper_says_otherwise():
     sim = FakeSim(TOWER)
     sim.report_holding = False
-    spec = jt.build_episode_spec(4, TOWER, SUPPLY, episode_set="D", placed_count=4)
+    spec = jt.build_episode_spec(4, TOWER, SCATTER, episode_set="D", placed_count=4)
     result = _run(sim, spec)
     assert result["outcome"] == "success", result
     assert result["holding_after_lift"] and not result["gripper_reported_holding"]
@@ -274,14 +288,14 @@ def test_held_block_counts_even_when_the_gripper_says_otherwise():
 
 def test_side_grasp_also_places():
     sim = FakeSim(TOWER)
-    spec = jt.build_episode_spec(4, TOWER, SUPPLY, episode_set="B", placed_count=5)
+    spec = jt.build_episode_spec(4, TOWER, SCATTER, episode_set="B", placed_count=5)
     result = _run(sim, spec, grasp=pe.GraspConfig(axis="side"))
     assert result["outcome"] == "success", result
 
 
 def test_set_d_straightens_the_misplaced_block_first():
     sim = FakeSim(TOWER)
-    spec = jt.build_episode_spec(9, TOWER, SUPPLY, episode_set="D", placed_count=4)
+    spec = jt.build_episode_spec(9, TOWER, SCATTER, episode_set="D", placed_count=4)
     result = _run(sim, spec)
     assert result["outcome"] == "success", result
     assert result["phases"][0] == pe.STAGE_STRAIGHTEN
@@ -292,7 +306,7 @@ def test_set_d_straightens_the_misplaced_block_first():
 
 def test_set_e_starts_hovering_beside_the_block_before_capture():
     sim = FakeSim(TOWER)
-    spec = jt.build_episode_spec(3, TOWER, SUPPLY, episode_set="E", placed_count=1)
+    spec = jt.build_episode_spec(3, TOWER, SCATTER, episode_set="E", placed_count=1)
     result = _run(sim, spec)
     assert result["outcome"] == "success", result
     assert "failed_grasp_start" in result["timing"]["phases_sec"]
@@ -300,7 +314,7 @@ def test_set_e_starts_hovering_beside_the_block_before_capture():
 
 def test_set_c_perturbs_before_capture_and_still_lands():
     sim = FakeSim(TOWER)
-    spec = jt.build_episode_spec(6, TOWER, SUPPLY, episode_set="C", placed_count=4)
+    spec = jt.build_episode_spec(6, TOWER, SCATTER, episode_set="C", placed_count=4)
     result = _run(sim, spec)
     assert result["outcome"] == "success", result
     assert "perturbed_start" in result["timing"]["phases_sec"]
@@ -310,7 +324,7 @@ def test_set_c_perturbs_before_capture_and_still_lands():
 
 def test_unstable_reset_skips_capture():
     sim = FakeSim(TOWER)
-    spec = jt.build_episode_spec(2, TOWER, SUPPLY, episode_set="A", placed_count=3)
+    spec = jt.build_episode_spec(2, TOWER, SCATTER, episode_set="A", placed_count=3)
     sim.reset_drift[TOWER.block_name(1)] = (0.01, 0.0)
     result = _run(sim, spec)
     assert result["outcome"] == "reset_unstable"
@@ -318,21 +332,122 @@ def test_unstable_reset_skips_capture():
     assert sim.stages == [] and not sim.capturing
 
 
-def test_chained_step_keeps_the_tower_and_moves_only_the_next_block():
+def test_chained_step_leaves_the_tower_and_the_loose_blocks_where_they_lie():
     sim = FakeSim(TOWER)
-    first = jt.build_episode_spec(5, TOWER, SUPPLY, episode_set="F", placed_count=0)
+    first = jt.build_episode_spec(5, TOWER, SCATTER, episode_set="F", placed_count=0)
     assert _run(sim, first)["outcome"] == "success"
-    placed_block = dict(sim.props)[TOWER.block_name(0)]
-    second = jt.build_episode_spec(5, TOWER, SUPPLY, episode_set="F", placed_count=1)
+    built = [first.next_block]
+    loose_names = [n for n in first.loose_poses if n != first.next_block]
+    world = _components(sim)[0]
+    loose = asyncio.run(pe.read_loose_poses(world, loose_names))
+    second = jt.chain_step_spec(5, TOWER, SCATTER, built, loose)
+    before = dict(sim.props)
     result = _run(sim, second, reset=False)
     assert result["outcome"] == "success", result
     assert "reset" not in result
-    assert sim.props[TOWER.block_name(0)] == placed_block
+    assert sim.props[first.next_block] == before[first.next_block]
+    for name in loose_names:
+        if name != second.next_block:
+            assert sim.props[name] == before[name]
+
+
+@pytest.mark.parametrize(
+    "episode_set,first", [("A", pe.STAGE_PICK), ("D", pe.STAGE_STRAIGHTEN), ("E", pe.STAGE_PICK)]
+)
+def test_capture_opens_with_the_first_real_stage(episode_set, first):
+    sim = FakeSim(TOWER)
+    spec = jt.build_episode_spec(9, TOWER, SCATTER, episode_set=episode_set, placed_count=4)
+    result = _run(sim, spec)
+    assert result["outcome"] == "success", result
+    assert sim.stages[0] == first and "base" not in sim.stages
+    assert [s["task"] for s in result["stages"]] == sim.stages
+
+
+def test_carry_and_retreat_last_one_action_chunk_on_their_own():
+    """The sim module holds a stage open until it has 33 frames; these two
+    one-move stages are long enough that the arm doesn't wait."""
+    sim = FakeSim(TOWER)
+    spec = jt.build_episode_spec(1, TOWER, SCATTER, episode_set="A", placed_count=4)
+    result = _run(sim, spec)
+    planned = {m["label"]: m["planned_sec"] for m in result["timing"]["moves"]}
+    chunk_sec = 33 / 15
+    assert planned["carry-cross"] >= chunk_sec - 1e-9
+    assert planned["retreat"] >= chunk_sec - 1e-9
+
+
+def test_nudge_and_upload_reach_the_module():
+    sim = FakeSim(TOWER)
+    spec = jt.build_episode_spec(1, TOWER, SCATTER, episode_set="A", placed_count=2)
+    nudge = {"amplitude_deg": list(pe.DN_BEST_NUDGE_DEG), "interval_s": 1.2, "duration_s": 0.6}
+    upload = {"dataset_id": "ds", "tags": ["isaac-episode"]}
+    result = _run(sim, spec, nudge=nudge, upload=upload)
+    assert result["outcome"] == "success", result
+    assert sim.start_command["nudge"] == nudge and result["nudge"] == nudge
+    assert sim.stop_command["upload"] == upload
+    # Nudges run in the pick and carry only. They stop while the carry is
+    # still being recorded, before the lowering is marked, and stay off.
+    assert sim.nudge_calls == [
+        (pe.STAGE_PICK, False),
+        (pe.STAGE_CARRY, False),
+        (pe.STAGE_CARRY, True),
+        (pe.STAGE_LOWER, True),
+        (pe.STAGE_RETREAT, True),
+    ]
+    plain = FakeSim(TOWER)
+    _run(plain, spec)
+    assert "nudge" not in plain.start_command and "upload" not in plain.stop_command
+    assert plain.nudge_calls == []
+
+
+def test_a_nudged_straighten_starts_paused_and_resumes_for_the_pick():
+    sim = FakeSim(TOWER)
+    spec = jt.build_episode_spec(4, TOWER, SCATTER, episode_set="D", placed_count=4)
+    assert spec.misplaced_block is not None
+    nudge = {"amplitude_deg": list(pe.DN_BEST_NUDGE_DEG), "interval_s": 1.2, "duration_s": 0.6}
+    _run(sim, spec, nudge=nudge)
+    assert sim.nudge_calls[:2] == [(pe.STAGE_STRAIGHTEN, True), (pe.STAGE_PICK, False)]
+    assert (pe.STAGE_CARRY, True) in sim.nudge_calls
+
+
+def test_about_half_the_episodes_are_nudged_and_reruns_agree():
+    def nudge(key, fraction=pe.DN_BEST_NUDGE_FRACTION, amplitude=pe.DN_BEST_NUDGE_DEG):
+        return pe.episode_nudge(key, fraction, list(amplitude), 1.2, 0.6)
+
+    nudged = [nudge(f"{seed:06d}") is not None for seed in range(2000)]
+    assert 0.45 < sum(nudged) / len(nudged) < 0.55
+    assert nudged == [nudge(f"{seed:06d}") is not None for seed in range(2000)]
+    assert nudge("000001", fraction=0.0) is None
+    assert all(nudge(f"{s}", amplitude=[0.0] * 6) is None for s in range(50))
+    picked = next(nudge(f"{s}") for s in range(50) if nudge(f"{s}"))
+    assert picked == {"amplitude_deg": list(pe.DN_BEST_NUDGE_DEG), "interval_s": 1.2, "duration_s": 0.6}
+
+
+def test_the_gripper_is_only_opened_or_closed():
+    sim = FakeSim(TOWER)
+    calls = []
+    world, gripper, motion, arm = _components(sim)
+
+    def record(name, fn):
+        async def wrapped(*args, **kwargs):
+            calls.append(name)
+            return await fn(*args, **kwargs)
+        return wrapped
+
+    gripper = SimpleNamespace(
+        **{name: record(name, getattr(gripper, name)) for name in vars(gripper)}
+    )
+    spec = jt.build_episode_spec(9, TOWER, SCATTER, episode_set="D", placed_count=4)
+    result = asyncio.run(
+        pe.execute_place(world, gripper, motion, arm, spec, TOWER, episode_output_dir="out")
+    )
+    assert result["outcome"] == "success", result
+    commands = {c for c in calls if c not in ("is_holding_something", "is_moving")}
+    assert commands == {"open", "grab"}
 
 
 def test_every_episode_ends_lifted_above_the_tower_holding_still():
     sim = FakeSim(TOWER)
-    spec = jt.build_episode_spec(1, TOWER, SUPPLY, episode_set="A", placed_count=4)
+    spec = jt.build_episode_spec(1, TOWER, SCATTER, episode_set="A", placed_count=4)
     result = _run(sim, spec)
     assert result["outcome"] == "success", result
     assert result["phases"][-2:] == [pe.STAGE_RETREAT, pe.STAGE_HOLD]
@@ -346,7 +461,7 @@ def test_every_episode_ends_lifted_above_the_tower_holding_still():
 def test_a_missed_grasp_still_ends_lifted_open_and_holding():
     sim = FakeSim(TOWER)
     sim.miss_grasp = True
-    spec = jt.build_episode_spec(2, TOWER, SUPPLY, episode_set="A", placed_count=3)
+    spec = jt.build_episode_spec(2, TOWER, SCATTER, episode_set="A", placed_count=3)
     result = _run(sim, spec)
     assert result["outcome"] == "failure" and result["failure"] == "grasp"
     assert result["phases"][-2:] == [pe.STAGE_RETREAT, pe.STAGE_HOLD]
@@ -367,7 +482,7 @@ def test_release_turns_the_wrist_the_short_way():
 
 def test_release_re_aims_from_a_hover_before_the_final_lower():
     sim = FakeSim(TOWER)
-    spec = jt.build_episode_spec(6, TOWER, SUPPLY, episode_set="C", placed_count=4)
+    spec = jt.build_episode_spec(6, TOWER, SCATTER, episode_set="C", placed_count=4)
     result = _run(sim, spec)
     assert result["outcome"] == "success", result
     labels = [m["label"] for m in result["timing"]["moves"]]
@@ -378,7 +493,7 @@ def test_release_re_aims_from_a_hover_before_the_final_lower():
 def test_an_error_ends_only_its_episode_and_closes_capture():
     sim = FakeSim(TOWER)
     sim.fail_on_move = 3
-    spec = jt.build_episode_spec(1, TOWER, SUPPLY, episode_set="A", placed_count=2)
+    spec = jt.build_episode_spec(1, TOWER, SCATTER, episode_set="A", placed_count=2)
     world, gripper, motion, arm = _components(sim)
     result = asyncio.run(
         pe.run_episode_safely(world, gripper, motion, arm, spec, TOWER, episode_output_dir="out")
@@ -386,3 +501,20 @@ def test_an_error_ends_only_its_episode_and_closes_capture():
     assert result["outcome"] == "error"
     assert "stream dropped" in result["error"]
     assert not sim.capturing
+
+
+def test_a_tiny_move_toppra_cannot_time_still_gets_a_trajectory():
+    # The Nov 20 straighten lowering TOPP-RA returned nothing for: 0.25 deg.
+    import oracle_episode as oe
+
+    start = [0.030750, -0.390441, -0.462837, 0.000125, -0.072492, 1.635386]
+    end = [0.030749, -0.393715, -0.463259, 0.000147, -0.069542, 1.635360]
+    limits = [math.radians(60.0)] * 6
+    points = oe._trajectory_points([{"arm": start}, {"arm": end}], "arm", limits, limits, 0.7333)
+    assert points[-1].time.total_seconds() >= 0.7333 - 1e-3
+    assert points[-1].positions == pytest.approx([math.degrees(v) for v in end], abs=1e-6)
+    assert points[0].positions == pytest.approx([math.degrees(v) for v in start], abs=1e-6)
+    for point in points:
+        assert max(map(abs, point.constraints.velocities)) <= 60.0
+        assert max(map(abs, point.constraints.accelerations)) <= 60.0
+    assert points[-1].constraints.velocities == [0.0] * 6

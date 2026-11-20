@@ -300,16 +300,17 @@ async def _stop_episode_capture(
         raise
 
 
-async def _start_episode_capture(world: Any, command: Mapping[str, Any]) -> None:
-    """Start capture and its base stage with cancellation-safe rollback."""
+async def _start_episode_capture(
+    world: Any, command: Mapping[str, Any], stage: str = DEFAULT_SUBTASK_PROMPT
+) -> None:
+    """Start capture and its first stage (by default the base stage) with
+    cancellation-safe rollback."""
     start_task = asyncio.create_task(world.do_command(dict(command)))
     started = False
     try:
         await asyncio.shield(start_task)
         started = True
-        await world.do_command(
-            {"command": "mark_episode_stage", "task": DEFAULT_SUBTASK_PROMPT}
-        )
+        await world.do_command({"command": "mark_episode_stage", "task": stage})
     except BaseException:
         if not started:
             try:
@@ -651,6 +652,48 @@ async def _plan_move(
 
 
 
+class _MinJerkTiming:
+    """A path timed by a min-jerk profile over `duration`, callable like a
+    TOPP-RA trajectory: (times, derivative order) -> joint values."""
+
+    def __init__(self, path: Any, duration: float) -> None:
+        self.path = path
+        self.duration = duration
+
+    def __call__(self, times: Any, order: int = 0) -> np.ndarray:
+        tau = np.clip(np.asarray(times, dtype=float) / self.duration, 0.0, 1.0)
+        s = 10 * tau**3 - 15 * tau**4 + 6 * tau**5
+        ds = (30 * tau**2 - 60 * tau**3 + 30 * tau**4) / self.duration
+        dds = (60 * tau - 180 * tau**2 + 120 * tau**3) / self.duration**2
+        if order == 0:
+            return self.path(s, 0)
+        if order == 1:
+            return self.path(s, 1) * ds[:, None]
+        return self.path(s, 2) * (ds**2)[:, None] + self.path(s, 1) * dds[:, None]
+
+
+def _min_jerk_timing(
+    path: Any,
+    max_velocity_rad_s: np.ndarray,
+    max_acceleration_rad_s2: np.ndarray,
+    minimum_duration_sec: float,
+) -> _MinJerkTiming:
+    """The shortest min-jerk timing of `path` (from `minimum_duration_sec`,
+    lengthened 1.25x at a time) whose velocities and accelerations stay
+    within the limits."""
+    duration = max(minimum_duration_sec, 0.1)
+    grid = np.linspace(0.0, 1.0, 201)
+    for _ in range(40):
+        timing = _MinJerkTiming(path, duration)
+        times = grid * duration
+        if np.all(np.abs(timing(times, 1)) <= max_velocity_rad_s) and np.all(
+            np.abs(timing(times, 2)) <= max_acceleration_rad_s2
+        ):
+            return timing
+        duration *= 1.25
+    raise RuntimeError("could not time the plan within the arm's limits")
+
+
 def _trajectory_points(
     plan: list[Mapping[str, Any]],
     arm_name: str,
@@ -718,7 +761,14 @@ def _trajectory_points(
         or not math.isfinite(parameterized.duration)
         or parameterized.duration <= 0.0
     ):
-        raise RuntimeError("TOPP-RA could not parameterize the plan")
+        # TOPP-RA returns nothing for very short paths (Nov 20: a 0.25 deg,
+        # two-waypoint Jenga straighten lowering); time those with min-jerk.
+        parameterized = _min_jerk_timing(
+            path,
+            np.asarray(max_velocity_rad_s),
+            np.asarray(max_acceleration_rad_s2),
+            minimum_duration_sec,
+        )
 
     source_duration = float(parameterized.duration)
     duration = max(source_duration, minimum_duration_sec)
