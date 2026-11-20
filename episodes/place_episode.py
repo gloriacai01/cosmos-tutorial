@@ -897,6 +897,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--tower-xy", type=_xy, default=jt.TowerConfig.base_xy_m, help="tower centre X,Y in the arm base frame (m)")
     parser.add_argument("--tower-yaw-deg", type=float, default=0.0, help="tower yaw in the world frame")
     parser.add_argument(
+        "--support-z-m", type=float, default=jt.TowerConfig.support_z_m,
+        help="world height of the table top the tower and loose blocks rest on (m), e.g. -0.0127 for armfarm01",
+    )
+    parser.add_argument(
         "--block-scale", type=float, default=1.0,
         help="uniform scale for the Jenga blocks (must match the sim props), e.g. 0.416 so a Lite6 can grip one by its ends",
     )
@@ -999,6 +1003,7 @@ async def _run(args: argparse.Namespace) -> int:
             xs, ys = zip(*scatter_corners)
             tower = jt.TowerConfig(
                 base_xy_m=tower_xy, base_yaw_deg=args.tower_yaw_deg, layers=args.layers,
+                support_z_m=args.support_z_m,
                 arm_xy_m=await arm_to_world_xy(machine, names.arm, 0.0, 0.0),
                 slot_gap_m=args.slot_gap_m, **jt.scaled_block_dims(args.block_scale),
             )
