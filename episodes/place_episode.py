@@ -294,6 +294,8 @@ class _Episode:
         self.timer = _PhaseTimer()
         self.capturing = False
         self.nudged = False
+        # Stages a nudged episode is nudged in; layer mode sets its own.
+        self.nudged_stages: frozenset[str] = NUDGED_STAGES
         self.phases: list[str] = []
         # The stage being recorded, and every stage with its first frame.
         self.stage: str | None = None
@@ -317,12 +319,12 @@ class _Episode:
         await self.set_nudges(stage)
 
     async def set_nudges(self, stage: str) -> None:
-        """Nudge only in NUDGED_STAGES. A nudge under way when they stop
+        """Nudge only in `nudged_stages`. A nudge under way when they stop
         fades out first; wait for it so the next stage starts un-nudged
         (callers pause before marking that stage)."""
         if not (self.capturing and self.nudged):
             return
-        paused = stage not in NUDGED_STAGES
+        paused = stage not in self.nudged_stages
         reply = await self.world.do_command({"command": "set_nudge_paused", "paused": paused})
         remaining = float(reply.get("remaining_s") or 0.0)
         if paused and remaining > 0.0:
@@ -338,7 +340,7 @@ class _Episode:
             return
         # Stop nudging before the stage begins, so a nudge's fade-out is
         # recorded in the stage it started in; resume once it has begun.
-        nudged = stage in NUDGED_STAGES
+        nudged = stage in self.nudged_stages
         if not nudged:
             await self.set_nudges(stage)
         reply = await self.world.do_command({"command": "mark_episode_stage", "task": stage})

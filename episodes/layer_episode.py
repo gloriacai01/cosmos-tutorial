@@ -71,6 +71,8 @@ async def execute_place_layer(
     # after the release keep the configured (end) grip.
     side = replace(grasp, axis="side")
     ep = pe._Episode(world, arm, gripper, motion, names, grasp)
+    # Nudge only away from the tower, as block mode does.
+    ep.nudged_stages = frozenset({STAGE_PICK_LAYER, STAGE_CARRY_LAYER})
     sim_clock = await pe._ElapsedClock.start(world, "episode")
     result: dict[str, Any] = {"spec": spec.summary(), "outcome": "incomplete"}
 
