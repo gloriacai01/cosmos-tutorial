@@ -677,16 +677,21 @@ async def execute_place(
     ep = _Episode(world, arm, gripper, motion, names, grasp)
     sim_clock = await _ElapsedClock.start(world, "episode")
     result: dict[str, Any] = {"spec": spec.summary(), "outcome": "incomplete"}
+    # The slot goes in every episode's record (and its start_episode target),
+    # prompted by name or not, so prompts can be rebuilt either way later.
+    try:
+        slot = jt.slot_metadata(tower, spec.next_slot)
+    except ValueError:
+        if slot_prompts:
+            raise
+        slot = None  # this tower's slots have no names (not 3 a layer, or ambiguous)
     if slot_prompts:
-        task = jt.slot_prompt(tower, spec.next_slot)
+        task = slot["slot_prompt"]
         stage = jt.slot_stage_prompts(tower, spec.next_slot)
         ep.stage_text = {
             STAGE_CARRY: stage["carry"], STAGE_LOWER: stage["lower"], STAGE_ADJUST: stage["adjust"],
         }
-        result["slot"] = {
-            "layer_number": jt.layer_number(spec.next_slot),
-            "name": jt.slot_name(tower, spec.next_slot),
-        }
+    result["slot"] = slot
     result["prompt"] = task
 
     await arm.move_to_joint_positions(JointPositions(values=list(home_joint_degrees)))
@@ -738,7 +743,7 @@ async def execute_place(
         await begin_episode_capture(
             ep, first_stage, spec.seed, spec.next_block, block,
             episode_output_dir=episode_output_dir, episode_id=episode_id,
-            cosmos_output_dir=cosmos_output_dir, task=task, nudge=nudge,
+            cosmos_output_dir=cosmos_output_dir, task=task, nudge=nudge, slot=slot,
         )
     result["nudge"] = dict(nudge) if nudge is not None and ep.capturing else None
 
@@ -887,9 +892,10 @@ async def begin_episode_capture(
     cosmos_output_dir: str | None,
     task: str,
     nudge: Mapping[str, Any] | None,
+    slot: Mapping[str, Any] | None = None,
 ) -> None:
     """Open the episode's capture with `first_stage` at frame 0. Shared by
-    block and layer mode."""
+    block and layer mode. `slot` (jt.slot_metadata) rides in the target."""
     start_command: dict[str, Any] = {
         "command": "start_episode",
         "output_dir": episode_output_dir,
@@ -908,6 +914,8 @@ async def begin_episode_capture(
             "rotation_wxyz": list(target_pose.orientation_wxyz),
         },
     }
+    if slot is not None:
+        start_command["target"]["slot"] = dict(slot)
     if nudge is not None:
         start_command["nudge"] = dict(nudge)
         ep.nudged = True

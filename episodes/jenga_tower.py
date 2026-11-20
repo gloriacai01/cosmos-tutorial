@@ -129,6 +129,15 @@ class TowerConfig:
             range(self.slots_per_layer)
         ):
             raise ValueError("slot_order must be a permutation of the slot indices")
+        # The G2's pads overhang an end-gripped block by ~2.3 mm a side, into a
+        # 3 mm seam: a middle block can't go in between two placed neighbours.
+        if (
+            self.slot_order is not None
+            and self.slots_per_layer % 2 == 1
+            and self.slots_per_layer > 1
+            and self.slot_order[-1] == self.slots_per_layer // 2
+        ):
+            raise ValueError("slot_order must never place the middle block last")
         if self.slot_gap_m < 0.0:
             raise ValueError("slot_gap_m must be non-negative")
 
@@ -316,12 +325,24 @@ def layer_slot_order(config: TowerConfig, layer: int) -> tuple[int, ...]:
 
 # --- Slot names and prompts ----------------------------------------------------
 #
-# Slots are named from the robot's side: standing at the arm base and looking
-# at the tower centre. A layer whose slots run across that line of sight has
-# right / middle / left slots; one whose slots run along it has near / middle /
-# far. Layers are numbered from 1 at the bottom. Episodes and evals share these
-# functions, so a prompt always names the slot the oracle filled.
+# Slots are named from the robot's side. The rule, in world XY on the nominal
+# (undrifted) tower: `forward` is the unit vector from the arm base
+# (`arm_xy_m`) to the tower centre (`base_xy_m`), `left` is `forward` turned
+# +90 deg, and a layer's slot axis runs from its slot 0 to its last slot.
+#   - along = axis . forward, across = axis . left; the axis's angle off the
+#     line of sight is atan2(|across|, |along|).
+#   - Under 45 deg the layer runs toward the arm: near / middle / far, near
+#     being the end with the smaller `along`.
+#   - Over 45 deg it runs across: right / middle / left, left being the end
+#     with the larger `across`.
+#   - Within SLOT_NAME_MARGIN_DEG of 45 deg the names would be a coin toss, so
+#     slot_names raises instead.
+# The tower needn't be straight out from the base (the rec-sim twin's is
+# 1.9 deg off); only its bearing from the base and its yaw matter. Layers are
+# numbered from 1 at the bottom. Episodes and evals share these functions, so
+# a prompt always names the slot the oracle filled.
 
+SLOT_NAME_MARGIN_DEG = 15.0
 SLOT_TASK_TEMPLATE = "place the block in the {slot} slot on layer {layer}"
 SLOT_STAGE_TEMPLATES = {
     "carry": "carry the block above the {slot} slot on layer {layer}",
@@ -343,9 +364,10 @@ def _sight_axes(config: TowerConfig) -> tuple[tuple[float, float], tuple[float, 
 
 
 def slot_names(config: TowerConfig, layer: int) -> tuple[str, str, str]:
-    """The name of each slot index in `layer`, seen from the arm: near /
-    middle / far when the layer's slots run toward the arm, right / middle /
-    left when they run across. Exactly 45 deg counts as toward."""
+    """The name of each slot index in `layer`, seen from the arm (the rule is
+    above): near / middle / far when the layer's slots run toward the arm,
+    right / middle / left when they run across. Raises when the layer runs
+    within SLOT_NAME_MARGIN_DEG of 45 deg to the arm's line of sight."""
     if config.slots_per_layer != 3:
         raise ValueError("slot names need three slots per layer")
     forward, left = _sight_axes(config)
@@ -354,7 +376,13 @@ def slot_names(config: TowerConfig, layer: int) -> tuple[str, str, str]:
     ax, ay = last[0] - first[0], last[1] - first[1]
     along = ax * forward[0] + ay * forward[1]
     across = ax * left[0] + ay * left[1]
-    if abs(along) >= abs(across):
+    angle = math.degrees(math.atan2(abs(across), abs(along)))
+    if abs(angle - 45.0) < SLOT_NAME_MARGIN_DEG:
+        raise ValueError(
+            f"layer {layer + 1}'s slots run {angle:.1f} deg off the arm's line of sight; "
+            "too close to 45 deg to call them near/far or left/right"
+        )
+    if angle < 45.0:
         return ("near", "middle", "far") if along > 0 else ("far", "middle", "near")
     return ("right", "middle", "left") if across > 0 else ("left", "middle", "right")
 
@@ -372,6 +400,20 @@ def slot_prompt(config: TowerConfig, ref: SlotRef, template: str = SLOT_TASK_TEM
     """The prompt for placing a block in `ref`, e.g. "place the block in the
     near slot on layer 2"."""
     return template.format(slot=slot_name(config, ref), layer=layer_number(ref))
+
+
+def slot_metadata(config: TowerConfig, ref: SlotRef) -> dict[str, Any]:
+    """Everything about the slot an episode fills, for its record: the
+    indices (0-based) and the prompt words (1-based layer, slot name), so a
+    dataset can be prompted with or without slot names later."""
+    return {
+        "placement_index": ref.placement_index,
+        "layer_index": ref.layer,
+        "slot_index": ref.slot,
+        "layer_number": layer_number(ref),
+        "slot_name": slot_name(config, ref),
+        "slot_prompt": slot_prompt(config, ref),
+    }
 
 
 def slot_stage_prompts(config: TowerConfig, ref: SlotRef) -> dict[str, str]:
