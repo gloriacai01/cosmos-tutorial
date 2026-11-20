@@ -19,11 +19,13 @@ def test_block_names_follow_placement_order():
 
 
 def test_slot_ref_fills_layers_in_slot_order():
-    config = jt.TowerConfig(slot_order=(2, 0, 1))
+    config = jt.TowerConfig(slot_order=(2, 1, 0))
     refs = [jt.slot_ref(config, k) for k in range(6)]
     assert [(r.layer, r.slot) for r in refs] == [
-        (0, 2), (0, 0), (0, 1), (1, 2), (1, 0), (1, 1),
+        (0, 2), (0, 1), (0, 0), (1, 2), (1, 1), (1, 0),
     ]
+    with pytest.raises(ValueError, match="middle"):
+        jt.TowerConfig(slot_order=(2, 0, 1))  # the middle block last
 
 
 def test_default_fill_order_is_middle_then_near_side_then_far_side():
@@ -54,6 +56,38 @@ def test_default_fill_order_is_middle_then_near_side_then_far_side():
 def test_slot_order_must_be_a_permutation():
     with pytest.raises(ValueError):
         jt.TowerConfig(slot_order=(0, 0, 1))
+
+
+def test_slots_are_named_from_the_arm_and_prompts_round_trip():
+    # Arm at the origin looking toward (0.30, 0.10): even layers run across
+    # that line (slot 0 on the robot's right), odd layers along it.
+    assert jt.slot_names(TOWER, 0) == ("right", "middle", "left")
+    assert jt.slot_names(TOWER, 1) == ("near", "middle", "far")
+    turned = jt.TowerConfig(base_yaw_deg=90.0)
+    assert jt.slot_names(turned, 0) == ("far", "middle", "near")
+    assert jt.slot_names(turned, 1) == ("right", "middle", "left")
+    ref = jt.slot_ref(TOWER, 4)  # layer 2, filled second: the near side
+    assert jt.slot_prompt(TOWER, ref) == "place the block in the near slot on layer 2"
+    assert jt.slot_stage_prompts(TOWER, ref)["lower"] == (
+        "lower the block into the near slot on layer 2 and open the gripper"
+    )
+    for k in range(TOWER.block_count):
+        ref = jt.slot_ref(TOWER, k)
+        assert jt.slot_ref_named(TOWER, jt.layer_number(ref), jt.slot_name(TOWER, ref)) == ref
+    with pytest.raises(ValueError):
+        jt.slot_ref_named(TOWER, 2, "left")  # layer 2 runs near/far
+    # A tower 45 deg off the arm's line of sight has no clear sides.
+    with pytest.raises(ValueError, match="45 deg"):
+        jt.slot_names(jt.TowerConfig(base_xy_m=(0.30, 0.0), base_yaw_deg=45.0), 0)
+    assert jt.slot_metadata(TOWER, jt.slot_ref(TOWER, 4)) == {
+        "placement_index": 4, "layer_index": 1, "slot_index": 0, "layer_number": 2,
+        "slot_name": "near", "slot_prompt": "place the block in the near slot on layer 2",
+    }
+    # The rec-sim twin builds every layer middle first, then right or near.
+    twin = jt.TowerConfig(base_xy_m=(0.327, 0.011), layers=3)
+    assert [jt.slot_name(twin, jt.slot_ref(twin, k)) for k in range(9)] == [
+        "middle", "right", "left", "middle", "near", "far", "middle", "right", "left",
+    ]
 
 
 def test_layers_alternate_ninety_degrees_and_stack_by_thickness():

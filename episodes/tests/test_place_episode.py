@@ -412,6 +412,27 @@ def test_a_nudged_straighten_starts_paused_and_resumes_for_the_pick():
     assert (pe.STAGE_CARRY, True) in sim.nudge_calls
 
 
+def test_slot_prompts_name_the_slot_and_keep_the_nudge_stages():
+    sim = FakeSim(TOWER)
+    spec = jt.build_episode_spec(1, TOWER, SCATTER, episode_set="A", placed_count=4, loose_blocks=1)
+    nudge = {"amplitude_deg": list(pe.DN_BEST_NUDGE_DEG), "interval_s": 1.2, "duration_s": 0.6}
+    result = _run(sim, spec, nudge=nudge, slot_prompts=True)
+    assert result["outcome"] == "success", result
+    prompt = "place the block in the near slot on layer 2"
+    assert result["prompt"] == sim.start_command["task"] == prompt
+    assert result["slot"] == jt.slot_metadata(TOWER, spec.next_slot)
+    assert sim.start_command["target"]["slot"] == result["slot"]
+    assert sim.stages == [
+        pe.STAGE_PICK,
+        "carry the block above the near slot on layer 2",
+        "lower the block into the near slot on layer 2 and open the gripper",
+        pe.STAGE_RETREAT,
+        pe.STAGE_HOLD,
+    ]
+    # Nudging follows the stage, not its prompt: pick and carry only.
+    assert [paused for _stage, paused in sim.nudge_calls] == [False, True, False, False, True, True, True]
+
+
 def test_about_half_the_episodes_are_nudged_and_reruns_agree():
     def nudge(key, fraction=pe.DN_BEST_NUDGE_FRACTION, amplitude=pe.DN_BEST_NUDGE_DEG):
         return pe.episode_nudge(key, fraction, list(amplitude), 1.2, 0.6)
@@ -521,3 +542,12 @@ def test_a_tiny_move_toppra_cannot_time_still_gets_a_trajectory():
         assert max(map(abs, point.constraints.velocities)) <= 60.0
         assert max(map(abs, point.constraints.accelerations)) <= 60.0
     assert points[-1].constraints.velocities == [0.0] * 6
+
+
+def test_every_episode_records_its_slot_even_without_slot_prompts():
+    sim = FakeSim(TOWER)
+    spec = jt.build_episode_spec(1, TOWER, SCATTER, episode_set="A", placed_count=4, loose_blocks=1)
+    result = _run(sim, spec)
+    assert result["prompt"] == sim.start_command["task"] == pe.DEFAULT_PROMPT
+    assert result["slot"]["slot_prompt"] == "place the block in the near slot on layer 2"
+    assert sim.start_command["target"]["slot"] == result["slot"]
