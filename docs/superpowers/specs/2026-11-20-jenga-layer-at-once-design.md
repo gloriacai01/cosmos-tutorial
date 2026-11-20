@@ -16,8 +16,8 @@ one. This adds the layer-at-once episodes to the existing generator.
   default (`--build block`) is today's behaviour, unchanged.
 - One script, no copied plumbing: batching, error handling, capture, stage
   prompts, nudges, upload and the end hold are shared with block mode.
-- `--chain --build layer` builds a whole tower unattended: assemble, assemble,
-  assemble, place layer, twelve times.
+- `--chain --build layer` builds a whole tower: twelve place-layer steps,
+  the reset spawning the next layer on the pad before each one.
 
 **Non-goals**
 - Choosing between the two ways (that's the sim comparison, later).
@@ -32,7 +32,7 @@ one. This adds the layer-at-once episodes to the existing generator.
 ## Approaches considered
 
 - **A. One script, `--build` switch, layer code in its own module (picked).**
-  Assembly reuses `execute_place` unchanged; only the layer place is new.
+  Only the layer place is new; block mode is untouched.
 - B. A separate `layer_episode.py` script. No merge risk with the open stack,
   but it copies connection, batching, error handling and capture.
 - C. Generalise `execute_place` to a 1- or 3-block payload. Cleanest model, but
@@ -46,39 +46,34 @@ The user picked A ("make it an arg but same script so code is not repetitive").
   The G2's pads are ~29.6 mm wide, so an end grip on the 81 mm bundle would
   clamp only the middle block. Closing across the three widths (81 mm on the
   pad, inside the G2's 95 mm opening) clamps the outer blocks; friction holds
-  the middle one. Single-block picks during assembly keep the end grip.
+  the middle one. Block mode keeps the end grip.
 
 ## The design
 
-### Two episode kinds in layer mode
+### One episode kind: place the layer
 
-1. **Assemble** — pick the next loose block (Dhriti's `choose_pick_block`) and
-   place it into the layer forming on the **layer pad**. The pad is modelled
-   as a one-layer `TowerConfig` at the pad pose, so this is `execute_place`
-   as it stands, with the same middle / near side / far side fill order, the
-   same 3 mm gaps, and the same end grip. Prompt: "add the next block to the
-   layer on the table".
-2. **Place layer** — side-grip the 3-block bundle on the pad, lift, carry
-   above the tower, lower onto the top layer, release, then Dhriti's end
-   (lift 10 cm above the new top, open, hold 3 s). Prompt: "place the layer
-   on the tower". Stages: pick up the layer / carry the layer above the tower
-   / lower the layer onto the tower and open the gripper / lift the gripper
-   away from the tower / hold still.
-
-A layer-mode episode is one or the other, chosen from the seed: 3 in 4 are
-assemble (pad holds 0, 1 or 2 blocks), 1 in 4 is place layer (pad full).
-That matches a real build's mix.
+The layer is given, not built (user, 2026-11-20): the episode reset spawns
+the 3 blocks side by side on the **layer pad**, and every layer-mode episode
+is a place-layer episode. Side-grip the bundle, lift, carry above the tower,
+lower onto the top layer, release, then Dhriti's end (lift 10 cm above the
+new top, open, hold 3 s). Prompt: "place the layer on the tower". Stages:
+pick up the layer / carry the layer above the tower / lower the layer onto
+the tower and open the gripper / lift the gripper away from the tower /
+hold still.
 
 ### Layer pad
 
-- A fixed spot on the table, default world (0.30, −0.15), 25 cm from the
-  default tower centre (0.30, 0.10) and inside the 850's reach.
+- Where the reset spawns the layer: default world (0.30, −0.15), 25 cm from
+  the default tower centre (0.30, 0.10) and inside the 850's reach.
   `--pad-xy` overrides it.
-- **The pad layer is laid in the direction of the tower's next layer**, so
-  the carry is a pure translation: no wrist turn with the bundle.
-- Scattered loose blocks stay clear of the pad footprint by the same margin
-  they keep from the tower (`ScatterConfig.tower_clearance_m`), and blocks on
-  the pad are never in the loose set.
+- The spawned layer points in the direction of the tower's next layer, so the
+  carry is nearly a pure translation. Per seed (my call, so the policy has to
+  look rather than memorise): the pad centre is jittered ±1.5 cm and its yaw
+  ±10°, and the three blocks get the tower's seam jitter. The seam between
+  blocks is 1 mm (no end-grip finger has to fit between them).
+- Blocks not in the tower or on the pad are scattered on the table as in
+  block mode, as distractors (my call: same scene as block mode), and keep
+  clear of the pad footprint by `ScatterConfig.tower_clearance_m`.
 
 ### Place-layer geometry
 
@@ -93,12 +88,10 @@ That matches a real build's mix.
 
 ### Episode sets in layer mode
 
-- Assemble: sets A–E as today, applied to the pad's partial layer.
-- Place layer: A (clean tower), B (drifted tower), C (perturbed start). D and
-  E are left out for now; the result says which set ran.
-- F (`--chain`): build the whole tower from scattered blocks; stop with
-  `failure: no_clear_block` as block mode does.
-- Tower height for place layer: uniform over 0–11 complete layers.
+- A (clean tower), B (drifted tower), C (perturbed start). D and E are left
+  out for now; the result says which set ran.
+- F (`--chain`): build the whole tower, layer by layer.
+- Tower height: uniform over 0–11 complete layers.
 
 ### Results
 
@@ -108,16 +101,15 @@ the placement tolerance (2 mm / 2°) and no lower block disturbed.
 
 ### Code shape
 
-- `jenga_tower.py`: `PadConfig`, pad-as-tower helper, layer-mode spec
-  builder (episode kind, pad contents, next layer's slot poses), scatter
-  keeps clear of the pad.
+- `jenga_tower.py`: `PadConfig`, pad layer poses (jittered), layer-mode
+  spec builder (tower of whole layers, pad blocks, next layer's slot poses),
+  scatter keeps clear of the pad.
 - `layer_episode.py` (new): `execute_place_layer` using `_Episode`'s
   `go/transit/grab/open/mark/finish`.
 - `place_episode.py`: `--build {block,layer}`, `--pad-xy`; dispatch only.
 - Tests in the kinematic fake: side-grip yaw, no wrist turn over the tower,
-  pad direction follows the tower's next layer, scatter clear of the pad,
-  episode-kind mix, a chained layer build completes, and block mode
-  unchanged.
+  the pad layer follows the tower's next layer, scatter clear of the pad,
+  a chained layer build completes, and block mode unchanged.
 
 ## Left to the builder
 
@@ -129,3 +121,5 @@ the placement tolerance (2 mm / 2°) and no lower block disturbed.
 
 - That the bundle holds in a side grip (middle block by friction) through
   the carry. If it slips, options are a slower carry or a higher grip force.
+- That the 1 mm pad seams and the ±10° pad yaw are within what the side grip
+  squares up.
