@@ -21,6 +21,9 @@ builds lay a fresh block from the parked ones before each step.
 
 Each episode is recorded with one prompt for the whole placement (`--task`)
 and a prompt per stage (pick, carry, lower, ...) through `mark_episode_stage`.
+`--slot-prompts` names the slot instead ("place the block in the near slot on
+layer 2"; jenga_tower.slot_prompt, shared with evals), in the episode prompt
+and the carry, lower and adjust stage prompts.
 A stage needs at least one 33-frame action chunk to yield a training sample;
 the sim module holds a shorter stage open (the arm waits) until it has one,
 so the carry and retreat moves alone last that long and the arm rarely waits.
@@ -296,6 +299,9 @@ class _Episode:
         self.nudged = False
         # Stages a nudged episode is nudged in; layer mode sets its own.
         self.nudged_stages: frozenset[str] = NUDGED_STAGES
+        # The prompt recorded for a stage, if not the stage's own name (slot
+        # prompts). Stages are still tracked, and nudged, by name.
+        self.stage_text: dict[str, str] = {}
         self.phases: list[str] = []
         # The stage being recorded, and every stage with its first frame.
         self.stage: str | None = None
@@ -310,10 +316,11 @@ class _Episode:
 
     async def begin_capture(self, command: Mapping[str, Any], stage: str) -> None:
         """Start capture with `stage` as its first stage, at frame 0."""
-        await _start_episode_capture(self.world, command, stage)
+        text = self.stage_text.get(stage, stage)
+        await _start_episode_capture(self.world, command, text)
         self.capturing = True
         self.stage = stage
-        self.stages.append({"task": stage, "start_frame": 0})
+        self.stages.append({"task": text, "start_frame": 0})
         if stage not in self.phases:
             self.phases.append(stage)
         await self.set_nudges(stage)
@@ -347,9 +354,10 @@ class _Episode:
         nudged = stage in self.nudged_stages
         if not nudged:
             await self.set_nudges(stage)
-        reply = await self.world.do_command({"command": "mark_episode_stage", "task": stage})
+        text = self.stage_text.get(stage, stage)
+        reply = await self.world.do_command({"command": "mark_episode_stage", "task": text})
         self.stage = stage
-        self.stages.append({"task": stage, "start_frame": reply.get("start_frame")})
+        self.stages.append({"task": text, "start_frame": reply.get("start_frame")})
         if nudged:
             await self.set_nudges(stage)
 
@@ -659,14 +667,27 @@ async def execute_place(
     home_joint_degrees: Sequence[float] = UF850_HOME_JOINT_DEGREES,
     nudge: Mapping[str, Any] | None = None,
     upload: Mapping[str, Any] | None = None,
+    slot_prompts: bool = False,
 ) -> dict[str, Any]:
     """Run one placement episode from `spec`. With `reset=False` (chained
     builds) the tower and the loose blocks are left as they lie. `nudge` and
     `upload` go to start_episode and stop_episode as the pick oracle sends
-    them."""
+    them. With `slot_prompts`, the episode's prompt and its carry, lower and
+    adjust stage prompts name the slot (jt.slot_prompt) instead of `task`."""
     ep = _Episode(world, arm, gripper, motion, names, grasp)
     sim_clock = await _ElapsedClock.start(world, "episode")
     result: dict[str, Any] = {"spec": spec.summary(), "outcome": "incomplete"}
+    if slot_prompts:
+        task = jt.slot_prompt(tower, spec.next_slot)
+        stage = jt.slot_stage_prompts(tower, spec.next_slot)
+        ep.stage_text = {
+            STAGE_CARRY: stage["carry"], STAGE_LOWER: stage["lower"], STAGE_ADJUST: stage["adjust"],
+        }
+        result["slot"] = {
+            "layer_number": jt.layer_number(spec.next_slot),
+            "name": jt.slot_name(tower, spec.next_slot),
+        }
+    result["prompt"] = task
 
     await arm.move_to_joint_positions(JointPositions(values=list(home_joint_degrees)))
     await ep.open("open")
@@ -1017,6 +1038,12 @@ def _parser() -> argparse.ArgumentParser:
         help="--build block: lay only this many blocks on the table (1: just the block "
         "to pick) and park the rest; default every block not in the tower",
     )
+    parser.add_argument(
+        "--slot-prompts", action="store_true",
+        help="--build block: prompt each episode with its slot, e.g. 'place the block in the "
+        "near slot on layer 2' (jenga_tower.slot_prompt), and name it in the carry, lower "
+        "and adjust stage prompts; replaces --task",
+    )
     parser.add_argument("--chain", action="store_true", help="set F: build whole towers without resets")
     parser.add_argument("--layers", type=int, default=jt.TowerConfig.layers)
     parser.add_argument("--tower-xy", type=_xy, default=jt.TowerConfig.base_xy_m, help="tower centre X,Y in the arm base frame (m)")
@@ -1105,6 +1132,8 @@ def _parser() -> argparse.ArgumentParser:
 async def _run(args: argparse.Namespace) -> int:
     if args.loose_blocks is not None and args.build != "block":
         raise SystemExit("--loose-blocks is for --build block only")
+    if args.slot_prompts and (args.build != "block" or args.task):
+        raise SystemExit("--slot-prompts is for --build block only and replaces --task")
     names = MachineNames(
         world=args.world, arm=args.arm, gripper=args.gripper, motion=args.motion,
         fixed_camera=args.fixed_camera, fixed_camera_2=args.fixed_camera_2,
@@ -1193,6 +1222,7 @@ async def _run(args: argparse.Namespace) -> int:
                         args.nudge_interval_sec, args.nudge_duration_sec,
                     ),
                     upload=upload,
+                    **({"slot_prompts": True} if args.slot_prompts else {}),
                 )
                 result["episode_id"] = episode_id
                 result["build"] = args.build

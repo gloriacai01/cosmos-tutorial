@@ -314,6 +314,84 @@ def layer_slot_order(config: TowerConfig, layer: int) -> tuple[int, ...]:
     return tuple(sorted(range(config.slots_per_layer), key=key))
 
 
+# --- Slot names and prompts ----------------------------------------------------
+#
+# Slots are named from the robot's side: standing at the arm base and looking
+# at the tower centre. A layer whose slots run across that line of sight has
+# right / middle / left slots; one whose slots run along it has near / middle /
+# far. Layers are numbered from 1 at the bottom. Episodes and evals share these
+# functions, so a prompt always names the slot the oracle filled.
+
+SLOT_TASK_TEMPLATE = "place the block in the {slot} slot on layer {layer}"
+SLOT_STAGE_TEMPLATES = {
+    "carry": "carry the block above the {slot} slot on layer {layer}",
+    "lower": "lower the block into the {slot} slot on layer {layer} and open the gripper",
+    "adjust": "adjust the block into the {slot} slot on layer {layer}",
+}
+
+
+def _sight_axes(config: TowerConfig) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Unit vectors from the arm base toward the tower centre, and to the
+    robot's left of that line, in world XY."""
+    dx = config.base_xy_m[0] - config.arm_xy_m[0]
+    dy = config.base_xy_m[1] - config.arm_xy_m[1]
+    norm = math.hypot(dx, dy)
+    if norm < 1e-9:
+        raise ValueError("the tower centre is on the arm base, so its slots have no sides")
+    forward = (dx / norm, dy / norm)
+    return forward, (-forward[1], forward[0])
+
+
+def slot_names(config: TowerConfig, layer: int) -> tuple[str, str, str]:
+    """The name of each slot index in `layer`, seen from the arm: near /
+    middle / far when the layer's slots run toward the arm, right / middle /
+    left when they run across. Exactly 45 deg counts as toward."""
+    if config.slots_per_layer != 3:
+        raise ValueError("slot names need three slots per layer")
+    forward, left = _sight_axes(config)
+    first = nominal_slot_pose(config, SlotRef(0, layer, 0)).position
+    last = nominal_slot_pose(config, SlotRef(0, layer, 2)).position
+    ax, ay = last[0] - first[0], last[1] - first[1]
+    along = ax * forward[0] + ay * forward[1]
+    across = ax * left[0] + ay * left[1]
+    if abs(along) >= abs(across):
+        return ("near", "middle", "far") if along > 0 else ("far", "middle", "near")
+    return ("right", "middle", "left") if across > 0 else ("left", "middle", "right")
+
+
+def slot_name(config: TowerConfig, ref: SlotRef) -> str:
+    return slot_names(config, ref.layer)[ref.slot]
+
+
+def layer_number(ref: SlotRef) -> int:
+    """The layer as prompts count it: 1 is the bottom."""
+    return ref.layer + 1
+
+
+def slot_prompt(config: TowerConfig, ref: SlotRef, template: str = SLOT_TASK_TEMPLATE) -> str:
+    """The prompt for placing a block in `ref`, e.g. "place the block in the
+    near slot on layer 2"."""
+    return template.format(slot=slot_name(config, ref), layer=layer_number(ref))
+
+
+def slot_stage_prompts(config: TowerConfig, ref: SlotRef) -> dict[str, str]:
+    """The slot-naming stage prompts (carry, lower, adjust) for `ref`."""
+    return {stage: slot_prompt(config, ref, t) for stage, t in SLOT_STAGE_TEMPLATES.items()}
+
+
+def slot_ref_named(config: TowerConfig, layer: int, name: str) -> SlotRef:
+    """The slot a prompt names, by its 1-based layer number and slot name;
+    for evals that turn a prompt back into a target."""
+    if not 1 <= layer <= config.layers:
+        raise ValueError(f"layer {layer} outside 1..{config.layers}")
+    names = slot_names(config, layer - 1)
+    if name not in names:
+        raise ValueError(f"layer {layer} has slots {names}, not {name!r}")
+    slot = names.index(name)
+    order = layer_slot_order(config, layer - 1)
+    return SlotRef((layer - 1) * config.slots_per_layer + order.index(slot), layer - 1, slot)
+
+
 def _rotate_xy(x: float, y: float, yaw_deg: float) -> tuple[float, float]:
     c, s = math.cos(math.radians(yaw_deg)), math.sin(math.radians(yaw_deg))
     return (c * x - s * y, s * x + c * y)
