@@ -384,13 +384,14 @@ def test_nudge_and_upload_reach_the_module():
     assert result["outcome"] == "success", result
     assert sim.start_command["nudge"] == nudge and result["nudge"] == nudge
     assert sim.stop_command["upload"] == upload
-    # Nudges run in the pick and carry only, and stop from the lowering on.
+    # Nudges run in the pick and carry only. They stop while the carry is
+    # still being recorded, before the lowering is marked, and stay off.
     assert sim.nudge_calls == [
         (pe.STAGE_PICK, False),
         (pe.STAGE_CARRY, False),
+        (pe.STAGE_CARRY, True),
         (pe.STAGE_LOWER, True),
         (pe.STAGE_RETREAT, True),
-        (pe.STAGE_HOLD, True),
     ]
     plain = FakeSim(TOWER)
     _run(plain, spec)
@@ -405,7 +406,7 @@ def test_a_nudged_straighten_starts_paused_and_resumes_for_the_pick():
     nudge = {"amplitude_deg": list(pe.DN_BEST_NUDGE_DEG), "interval_s": 1.2, "duration_s": 0.6}
     _run(sim, spec, nudge=nudge)
     assert sim.nudge_calls[:2] == [(pe.STAGE_STRAIGHTEN, True), (pe.STAGE_PICK, False)]
-    assert (pe.STAGE_LOWER, True) in sim.nudge_calls
+    assert (pe.STAGE_CARRY, True) in sim.nudge_calls
 
 
 def test_about_half_the_episodes_are_nudged_and_reruns_agree():
@@ -500,3 +501,20 @@ def test_an_error_ends_only_its_episode_and_closes_capture():
     assert result["outcome"] == "error"
     assert "stream dropped" in result["error"]
     assert not sim.capturing
+
+
+def test_a_tiny_move_toppra_cannot_time_still_gets_a_trajectory():
+    # The Nov 20 straighten lowering TOPP-RA returned nothing for: 0.25 deg.
+    import oracle_episode as oe
+
+    start = [0.030750, -0.390441, -0.462837, 0.000125, -0.072492, 1.635386]
+    end = [0.030749, -0.393715, -0.463259, 0.000147, -0.069542, 1.635360]
+    limits = [math.radians(60.0)] * 6
+    points = oe._trajectory_points([{"arm": start}, {"arm": end}], "arm", limits, limits, 0.7333)
+    assert points[-1].time.total_seconds() >= 0.7333 - 1e-3
+    assert points[-1].positions == pytest.approx([math.degrees(v) for v in end], abs=1e-6)
+    assert points[0].positions == pytest.approx([math.degrees(v) for v in start], abs=1e-6)
+    for point in points:
+        assert max(map(abs, point.constraints.velocities)) <= 60.0
+        assert max(map(abs, point.constraints.accelerations)) <= 60.0
+    assert points[-1].constraints.velocities == [0.0] * 6

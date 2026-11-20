@@ -314,7 +314,8 @@ class _Episode:
 
     async def set_nudges(self, stage: str) -> None:
         """Nudge only in NUDGED_STAGES. A nudge under way when they stop
-        fades out first; wait for it so the next stage starts un-nudged."""
+        fades out first; wait for it so the next stage starts un-nudged
+        (callers pause before marking that stage)."""
         if not (self.capturing and self.nudged):
             return
         paused = stage not in NUDGED_STAGES
@@ -331,10 +332,16 @@ class _Episode:
             self.phases.append(stage)
         if not self.capturing or stage == self.stage:
             return
+        # Stop nudging before the stage begins, so a nudge's fade-out is
+        # recorded in the stage it started in; resume once it has begun.
+        nudged = stage in NUDGED_STAGES
+        if not nudged:
+            await self.set_nudges(stage)
         reply = await self.world.do_command({"command": "mark_episode_stage", "task": stage})
         self.stage = stage
         self.stages.append({"task": stage, "start_frame": reply.get("start_frame")})
-        await self.set_nudges(stage)
+        if nudged:
+            await self.set_nudges(stage)
 
     async def go(
         self,
