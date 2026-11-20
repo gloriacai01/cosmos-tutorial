@@ -49,6 +49,7 @@ class FakeSim:
         # Make the n-th streamed move raise, as a dropped connection would.
         self.fail_on_move: int | None = None
         self.moves: list[tuple[tuple[float, float, float], tuple[float, float, float]]] = []
+        self.nudge_calls: list[tuple[str | None, bool]] = []
 
     # -- world ---------------------------------------------------------
     async def do_command(self, command):
@@ -85,6 +86,10 @@ class FakeSim:
             self.start_command = dict(command)
             self.capture_started = self.sim_time
             return {}
+        if cmd == "set_nudge_paused":
+            # (stage being recorded, paused) per call; a nudge is always mid-way.
+            self.nudge_calls.append((self.stages[-1] if self.stages else None, command["paused"]))
+            return {"nudging": True, "paused": command["paused"], "remaining_s": 0.3}
         if cmd == "mark_episode_stage":
             self.stages.append(command["task"])
             frame = round((self.sim_time - self.capture_started) * 15)
@@ -379,9 +384,28 @@ def test_nudge_and_upload_reach_the_module():
     assert result["outcome"] == "success", result
     assert sim.start_command["nudge"] == nudge and result["nudge"] == nudge
     assert sim.stop_command["upload"] == upload
+    # Nudges run in the pick and carry only, and stop from the lowering on.
+    assert sim.nudge_calls == [
+        (pe.STAGE_PICK, False),
+        (pe.STAGE_CARRY, False),
+        (pe.STAGE_LOWER, True),
+        (pe.STAGE_RETREAT, True),
+        (pe.STAGE_HOLD, True),
+    ]
     plain = FakeSim(TOWER)
     _run(plain, spec)
     assert "nudge" not in plain.start_command and "upload" not in plain.stop_command
+    assert plain.nudge_calls == []
+
+
+def test_a_nudged_straighten_starts_paused_and_resumes_for_the_pick():
+    sim = FakeSim(TOWER)
+    spec = jt.build_episode_spec(4, TOWER, SCATTER, episode_set="D", placed_count=4)
+    assert spec.misplaced_block is not None
+    nudge = {"amplitude_deg": list(pe.DN_BEST_NUDGE_DEG), "interval_s": 1.2, "duration_s": 0.6}
+    _run(sim, spec, nudge=nudge)
+    assert sim.nudge_calls[:2] == [(pe.STAGE_STRAIGHTEN, True), (pe.STAGE_PICK, False)]
+    assert (pe.STAGE_LOWER, True) in sim.nudge_calls
 
 
 def test_about_half_the_episodes_are_nudged_and_reruns_agree():

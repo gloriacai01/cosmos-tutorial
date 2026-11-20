@@ -143,6 +143,13 @@ DN_BEST_NUDGE_DEG = (2.5, 3.3, 2.9, 1.5, 3.2, 5.0)
 DN_BEST_NUDGE_INTERVAL_SEC = 1.2
 DN_BEST_NUDGE_DURATION_SEC = 0.6
 DN_BEST_NUDGE_FRACTION = 0.5
+# Nudged episodes are nudged only while these stages run: the arm is away from
+# the tower. Every stage that touches the tower (straighten, lower, adjust,
+# retreat, hold) is recorded un-nudged, so a nudge can't knock the tower over
+# and the end hold is truly still. Needs the sim module's set_nudge_paused.
+NUDGED_STAGES = frozenset({STAGE_PICK, STAGE_CARRY})
+# Extra wait after a stopped nudge's reported fade-out: one 15 Hz frame.
+NUDGE_FADE_MARGIN_SEC = 1.0 / 15.0
 
 # Tower reset: blocks are set this far above their rest height per layer so
 # they never start interpenetrating, then allowed to settle.
@@ -282,6 +289,7 @@ class _Episode:
         self.grasp = grasp
         self.timer = _PhaseTimer()
         self.capturing = False
+        self.nudged = False
         self.phases: list[str] = []
         # The stage being recorded, and every stage with its first frame.
         self.stage: str | None = None
@@ -302,6 +310,18 @@ class _Episode:
         self.stages.append({"task": stage, "start_frame": 0})
         if stage not in self.phases:
             self.phases.append(stage)
+        await self.set_nudges(stage)
+
+    async def set_nudges(self, stage: str) -> None:
+        """Nudge only in NUDGED_STAGES. A nudge under way when they stop
+        fades out first; wait for it so the next stage starts un-nudged."""
+        if not (self.capturing and self.nudged):
+            return
+        paused = stage not in NUDGED_STAGES
+        reply = await self.world.do_command({"command": "set_nudge_paused", "paused": paused})
+        remaining = float(reply.get("remaining_s") or 0.0)
+        if paused and remaining > 0.0:
+            await _wait_sim_duration(self.world, remaining + NUDGE_FADE_MARGIN_SEC)
 
     async def mark(self, stage: str) -> None:
         """Begin a stage: list it in the result and, while capturing, write it
@@ -314,6 +334,7 @@ class _Episode:
         reply = await self.world.do_command({"command": "mark_episode_stage", "task": stage})
         self.stage = stage
         self.stages.append({"task": stage, "start_frame": reply.get("start_frame")})
+        await self.set_nudges(stage)
 
     async def go(
         self,
@@ -680,6 +701,7 @@ async def execute_place(
         }
         if nudge is not None:
             start_command["nudge"] = dict(nudge)
+            ep.nudged = True
         first_stage = STAGE_STRAIGHTEN if spec.misplaced_block is not None else STAGE_PICK
         with ep.timer.phase("capture_start"):
             await ep.begin_capture(start_command, first_stage)
