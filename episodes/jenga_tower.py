@@ -228,9 +228,13 @@ class EpisodeSpec:
     failed_grasp_aim_xy_m: tuple[float, float] | None = None
     # Set C: start from a perturbed arm pose before capture.
     perturbed_start: bool = False
-    # Every block not in the tower, lying on the table, by prop name; the
-    # next block is one of them.
+    # The blocks lying on the table, by prop name; the next block is one of
+    # them. Every block not in the tower, unless the build limits how many
+    # lie out (--loose-blocks).
     loose_poses: Mapping[str, Pose] = field(default_factory=dict)
+    # Chained builds with a loose-block limit: blocks laid on the table
+    # before this step (a subset of loose_poses), the rest stay as they lie.
+    fresh_poses: Mapping[str, Pose] = field(default_factory=dict)
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -606,15 +610,17 @@ def sample_loose_poses(
     *,
     keep_clear: Sequence[Pose] = (),
     require_pick: bool = True,
+    stream: str = "scatter",
 ) -> dict[str, Pose]:
     """Flat random poses on the table for every block in `names`: inside the
     region, `min_gap_m` apart, clear of the tower and of the `keep_clear`
-    blocks (the layer pad) by `tower_clearance_m`, and, with `require_pick`,
-    with at least one block the pick rule accepts. Raises if the region can't
-    hold them all."""
+    blocks (the layer pad, or loose blocks already down) by
+    `tower_clearance_m`, and, with `require_pick`, with at least one block the
+    pick rule accepts. `stream` keys the draws, so each step of a chained
+    build gets its own layout. Raises if the region can't hold them all."""
     for layout in range(SCATTER_LAYOUTS):
         poses = _scatter_once(
-            tower, scatter, _rng(f"scatter:{layout}", seed), names, keep_clear
+            tower, scatter, _rng(f"{stream}:{layout}", seed), names, keep_clear
         )
         if poses is None:
             continue
@@ -681,13 +687,17 @@ def build_episode_spec(
     *,
     episode_set: str | None = None,
     placed_count: int | None = None,
+    loose_blocks: int | None = None,
 ) -> EpisodeSpec:
     """Decide one episode from its seed.
 
     Tower height is uniform over 0..block_count-1, so every slot is the next
     slot equally often and the top layers get as much data as the bottom.
     Set D needs a block to misplace, so it never starts from an empty tower.
-    Every block not in the tower is scattered on the table."""
+    Every block not in the tower is scattered on the table, or only the first
+    `loose_blocks` of them (the reset parks the rest off the table)."""
+    if loose_blocks is not None and loose_blocks < 1:
+        raise ValueError("loose_blocks must be at least 1")
     chosen = episode_set or sample_episode_set(seed, sampling.set_weights)
     if chosen not in EPISODE_SETS:
         raise ValueError(f"unknown episode set {chosen!r}")
@@ -703,7 +713,10 @@ def build_episode_spec(
     names = prop_order(tower, seed)
     poses = tower_poses(tower, seed, placed_count, drifted, names)
     ref = slot_ref(tower, placed_count)
-    loose = sample_loose_poses(tower, scatter, seed, names[placed_count:])
+    off_tower = names[placed_count:]
+    if loose_blocks is not None:
+        off_tower = off_tower[:loose_blocks]
+    loose = sample_loose_poses(tower, scatter, seed, off_tower)
     next_block = choose_pick_block(tower, scatter, loose)
     assert next_block is not None  # sample_loose_poses guarantees one
     pick_pose = loose[next_block]
@@ -753,13 +766,28 @@ def chain_step_spec(
     scatter: ScatterConfig,
     tower_names: Sequence[str],
     loose: Mapping[str, Pose],
+    loose_blocks: int | None = None,
 ) -> EpisodeSpec | None:
     """The next step of a chained build (set F), from the tower built so far
     (prop names in placement order) and where the loose blocks lie now. The
-    loose blocks stay where they are. None if no loose block can be picked."""
+    loose blocks stay where they are; with `loose_blocks`, parked blocks are
+    laid out (fresh_poses) to top the table back up to that many. None if no
+    loose block can be picked."""
     placed_count = len(tower_names)
     if placed_count >= tower.block_count:
         raise ValueError("the tower is already complete")
+    fresh: dict[str, Pose] = {}
+    if loose_blocks is not None and len(loose) < loose_blocks:
+        parked = [
+            name for name in prop_order(tower, seed)
+            if name not in tower_names and name not in loose
+        ]
+        fresh = sample_loose_poses(
+            tower, scatter, seed, parked[: loose_blocks - len(loose)],
+            keep_clear=list(loose.values()), require_pick=False,
+            stream=f"scatter-step{placed_count}",
+        )
+        loose = {**loose, **fresh}
     next_block = choose_pick_block(tower, scatter, loose)
     if next_block is None:
         return None
@@ -773,6 +801,7 @@ def chain_step_spec(
         next_slot_pose=next_slot_target(tower, seed, placed_count, False),
         pick_pose=loose[next_block],
         loose_poses=dict(loose),
+        fresh_poses=fresh,
     )
 
 

@@ -41,13 +41,7 @@ STAGE_LOWER_LAYER = "lower the layer onto the tower and open the gripper"
 async def lay_pad(world: Any, spec: jt.LayerSpec) -> None:
     """Chained builds: lay the next layer on the pad and leave the tower and
     the other loose blocks as they stand."""
-    await world.do_command({"command": "pause"})
-    try:
-        for name, pose in spec.pad_poses.items():
-            await world.do_command(pose.as_prop_command(name))
-    finally:
-        await world.do_command({"command": "play"})
-    await pe._wait_sim_duration(world, pe.RESET_SETTLE_SEC)
+    await pe.lay_props(world, spec.pad_poses)
 
 
 async def execute_place_layer(

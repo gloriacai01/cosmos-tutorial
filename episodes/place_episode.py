@@ -15,6 +15,10 @@ capture starts and only the recovery is recorded:
 Set F (`--chain`) builds a whole tower without resets, keeping the oracle's own
 small errors; loose blocks stay where they lie between steps.
 
+`--loose-blocks N` lays only N blocks on the table (`--loose-blocks 1`: one
+block to pick, no distractors) and parks the rest off the table. Chained
+builds lay a fresh block from the parked ones before each step.
+
 Each episode is recorded with one prompt for the whole placement (`--task`)
 and a prompt per stage (pick, carry, lower, ...) through `mark_episode_stage`.
 A stage needs at least one 33-frame action chunk to yield a training sample;
@@ -581,6 +585,18 @@ def table_poses(spec: Any) -> dict[str, jt.Pose]:
     return {**spec.loose_poses, **getattr(spec, "pad_poses", {})}
 
 
+async def lay_props(world: Any, poses: Mapping[str, jt.Pose]) -> None:
+    """Chained builds: lay these blocks on the table and leave the tower and
+    the other loose blocks as they stand."""
+    await world.do_command({"command": "pause"})
+    try:
+        for name, pose in poses.items():
+            await world.do_command(pose.as_prop_command(name))
+    finally:
+        await world.do_command({"command": "play"})
+    await _wait_sim_duration(world, RESET_SETTLE_SEC)
+
+
 async def read_loose_poses(world: Any, names: Sequence[str]) -> dict[str, jt.Pose]:
     """Where the loose blocks lie now, for the next step of a chained build."""
     poses = {}
@@ -653,6 +669,9 @@ async def execute_place(
         if not reset_report["stable"]:
             result["outcome"] = "reset_unstable"
             return result
+    elif spec.fresh_poses:
+        with ep.timer.phase("lay_blocks"):
+            await lay_props(world, spec.fresh_poses)
 
     tower_names = list(spec.tower_poses)
     before = await ep.read_poses(tower_names)
@@ -981,6 +1000,11 @@ def _parser() -> argparse.ArgumentParser:
         help="corner X,Y of the table region the loose blocks lie in, in the arm base frame (m)",
     )
     parser.add_argument("--scatter-max-xy", type=_xy, default=jt.ScatterConfig.region_max_xy_m)
+    parser.add_argument(
+        "--loose-blocks", type=int,
+        help="--build block: lay only this many blocks on the table (1: just the block "
+        "to pick) and park the rest; default every block not in the tower",
+    )
     parser.add_argument("--chain", action="store_true", help="set F: build whole towers without resets")
     parser.add_argument("--layers", type=int, default=jt.TowerConfig.layers)
     parser.add_argument("--tower-xy", type=_xy, default=jt.TowerConfig.base_xy_m, help="tower centre X,Y in the arm base frame (m)")
@@ -1067,6 +1091,8 @@ def _parser() -> argparse.ArgumentParser:
 
 
 async def _run(args: argparse.Namespace) -> int:
+    if args.loose_blocks is not None and args.build != "block":
+        raise SystemExit("--loose-blocks is for --build block only")
     names = MachineNames(
         world=args.world, arm=args.arm, gripper=args.gripper, motion=args.motion,
         fixed_camera=args.fixed_camera, fixed_camera_2=args.fixed_camera_2,
@@ -1170,6 +1196,7 @@ async def _run(args: argparse.Namespace) -> int:
                     spec = jt.build_episode_spec(
                         seed, tower, scatter,
                         episode_set=args.episode_set, placed_count=args.placed,
+                        loose_blocks=args.loose_blocks,
                     )
                     result = await run(spec, f"{seed:06d}", True)
                     # A tower that didn't stand at reset is not the oracle's failure.
@@ -1179,7 +1206,8 @@ async def _run(args: argparse.Namespace) -> int:
                 # Set F: one tower, built step by step without resets. Each
                 # step picks from where the loose blocks lie after the last.
                 spec = jt.build_episode_spec(
-                    seed, tower, scatter, episode_set="F", placed_count=args.placed or 0
+                    seed, tower, scatter, episode_set="F", placed_count=args.placed or 0,
+                    loose_blocks=args.loose_blocks,
                 )
                 built = list(spec.tower_poses)
                 reset = True
@@ -1196,7 +1224,9 @@ async def _run(args: argparse.Namespace) -> int:
                         break
                     loose_names = [n for n in spec.loose_poses if n != spec.next_block]
                     loose = await read_loose_poses(world, loose_names)
-                    next_spec = jt.chain_step_spec(seed, tower, scatter, built, loose)
+                    next_spec = jt.chain_step_spec(
+                        seed, tower, scatter, built, loose, args.loose_blocks
+                    )
                     if next_spec is None:
                         failures += 1
                         emit({
