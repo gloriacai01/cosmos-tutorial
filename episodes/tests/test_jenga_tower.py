@@ -199,6 +199,22 @@ def test_chain_step_builds_on_the_tower_and_picks_from_where_blocks_lie():
     assert jt.chain_step_spec(4, TOWER, SCATTER, built, {}) is None
 
 
+def test_loose_blocks_lays_only_that_many_and_chains_lay_a_fresh_one():
+    for seed in range(10):
+        spec = jt.build_episode_spec(seed, TOWER, SCATTER, episode_set="A", loose_blocks=1)
+        assert list(spec.loose_poses) == [spec.next_block]
+        assert spec.next_block == jt.prop_order(TOWER, seed)[spec.placed_count]
+    first = jt.build_episode_spec(4, TOWER, SCATTER, episode_set="F", placed_count=0, loose_blocks=1)
+    built, picks = [first.next_block], [first.pick_pose]
+    for _ in range(3):
+        step = jt.chain_step_spec(4, TOWER, SCATTER, built, {}, loose_blocks=1)
+        assert list(step.fresh_poses) == list(step.loose_poses) == [step.next_block]
+        assert step.next_block not in built
+        built.append(step.next_block)
+        picks.append(step.pick_pose)
+    assert len({p.position for p in picks}) == len(picks)  # a new spot each step
+
+
 def test_episode_sets_follow_weights():
     counts = Counter(jt.sample_episode_set(s, jt.EPISODE_SET_WEIGHTS) for s in range(5000))
     assert "F" not in counts

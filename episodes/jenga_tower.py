@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
 Position = tuple[float, float, float]
@@ -228,9 +228,13 @@ class EpisodeSpec:
     failed_grasp_aim_xy_m: tuple[float, float] | None = None
     # Set C: start from a perturbed arm pose before capture.
     perturbed_start: bool = False
-    # Every block not in the tower, lying on the table, by prop name; the
-    # next block is one of them.
+    # The blocks lying on the table, by prop name; the next block is one of
+    # them. Every block not in the tower, unless the build limits how many
+    # lie out (--loose-blocks).
     loose_poses: Mapping[str, Pose] = field(default_factory=dict)
+    # Chained builds with a loose-block limit: blocks laid on the table
+    # before this step (a subset of loose_poses), the rest stay as they lie.
+    fresh_poses: Mapping[str, Pose] = field(default_factory=dict)
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -557,7 +561,11 @@ SCATTER_LAYOUTS = 20
 
 
 def _scatter_once(
-    tower: TowerConfig, scatter: ScatterConfig, rng: random.Random, names: Sequence[str]
+    tower: TowerConfig,
+    scatter: ScatterConfig,
+    rng: random.Random,
+    names: Sequence[str],
+    keep_clear: Sequence[Pose] = (),
 ) -> dict[str, Pose] | None:
     lo_x, lo_y = scatter.region_min_xy_m
     hi_x, hi_y = scatter.region_max_xy_m
@@ -578,6 +586,11 @@ def _scatter_once(
             if math.dist((x, y), tower.base_xy_m) < tower_reach:
                 continue
             pose = Pose((x, y, z), yaw)
+            if any(
+                blocks_overlap(tower, pose, other, scatter.tower_clearance_m)
+                for other in keep_clear
+            ):
+                continue
             if not any(
                 blocks_overlap(tower, pose, other, scatter.min_gap_m)
                 for other in poses.values()
@@ -590,14 +603,28 @@ def _scatter_once(
 
 
 def sample_loose_poses(
-    tower: TowerConfig, scatter: ScatterConfig, seed: int, names: Sequence[str]
+    tower: TowerConfig,
+    scatter: ScatterConfig,
+    seed: int,
+    names: Sequence[str],
+    *,
+    keep_clear: Sequence[Pose] = (),
+    require_pick: bool = True,
+    stream: str = "scatter",
 ) -> dict[str, Pose]:
     """Flat random poses on the table for every block in `names`: inside the
-    region, `min_gap_m` apart, clear of the tower, with at least one block
-    the pick rule accepts. Raises if the region can't hold them all."""
+    region, `min_gap_m` apart, clear of the tower and of the `keep_clear`
+    blocks (the layer pad, or loose blocks already down) by
+    `tower_clearance_m`, and, with `require_pick`, with at least one block the
+    pick rule accepts. `stream` keys the draws, so each step of a chained
+    build gets its own layout. Raises if the region can't hold them all."""
     for layout in range(SCATTER_LAYOUTS):
-        poses = _scatter_once(tower, scatter, _rng(f"scatter:{layout}", seed), names)
-        if poses is not None and choose_pick_block(tower, scatter, poses) is not None:
+        poses = _scatter_once(
+            tower, scatter, _rng(f"{stream}:{layout}", seed), names, keep_clear
+        )
+        if poses is None:
+            continue
+        if not require_pick or choose_pick_block(tower, scatter, poses) is not None:
             return poses
     raise ValueError(
         f"could not lay {len(names)} loose blocks out in the scatter region; widen it"
@@ -660,13 +687,17 @@ def build_episode_spec(
     *,
     episode_set: str | None = None,
     placed_count: int | None = None,
+    loose_blocks: int | None = None,
 ) -> EpisodeSpec:
     """Decide one episode from its seed.
 
     Tower height is uniform over 0..block_count-1, so every slot is the next
     slot equally often and the top layers get as much data as the bottom.
     Set D needs a block to misplace, so it never starts from an empty tower.
-    Every block not in the tower is scattered on the table."""
+    Every block not in the tower is scattered on the table, or only the first
+    `loose_blocks` of them (the reset parks the rest off the table)."""
+    if loose_blocks is not None and loose_blocks < 1:
+        raise ValueError("loose_blocks must be at least 1")
     chosen = episode_set or sample_episode_set(seed, sampling.set_weights)
     if chosen not in EPISODE_SETS:
         raise ValueError(f"unknown episode set {chosen!r}")
@@ -682,7 +713,10 @@ def build_episode_spec(
     names = prop_order(tower, seed)
     poses = tower_poses(tower, seed, placed_count, drifted, names)
     ref = slot_ref(tower, placed_count)
-    loose = sample_loose_poses(tower, scatter, seed, names[placed_count:])
+    off_tower = names[placed_count:]
+    if loose_blocks is not None:
+        off_tower = off_tower[:loose_blocks]
+    loose = sample_loose_poses(tower, scatter, seed, off_tower)
     next_block = choose_pick_block(tower, scatter, loose)
     assert next_block is not None  # sample_loose_poses guarantees one
     pick_pose = loose[next_block]
@@ -732,13 +766,28 @@ def chain_step_spec(
     scatter: ScatterConfig,
     tower_names: Sequence[str],
     loose: Mapping[str, Pose],
+    loose_blocks: int | None = None,
 ) -> EpisodeSpec | None:
     """The next step of a chained build (set F), from the tower built so far
     (prop names in placement order) and where the loose blocks lie now. The
-    loose blocks stay where they are. None if no loose block can be picked."""
+    loose blocks stay where they are; with `loose_blocks`, parked blocks are
+    laid out (fresh_poses) to top the table back up to that many. None if no
+    loose block can be picked."""
     placed_count = len(tower_names)
     if placed_count >= tower.block_count:
         raise ValueError("the tower is already complete")
+    fresh: dict[str, Pose] = {}
+    if loose_blocks is not None and len(loose) < loose_blocks:
+        parked = [
+            name for name in prop_order(tower, seed)
+            if name not in tower_names and name not in loose
+        ]
+        fresh = sample_loose_poses(
+            tower, scatter, seed, parked[: loose_blocks - len(loose)],
+            keep_clear=list(loose.values()), require_pick=False,
+            stream=f"scatter-step{placed_count}",
+        )
+        loose = {**loose, **fresh}
     next_block = choose_pick_block(tower, scatter, loose)
     if next_block is None:
         return None
@@ -752,6 +801,262 @@ def chain_step_spec(
         next_slot_pose=next_slot_target(tower, seed, placed_count, False),
         pick_pose=loose[next_block],
         loose_poses=dict(loose),
+        fresh_poses=fresh,
+    )
+
+
+# --- Layer at a time ---------------------------------------------------------
+#
+# The training plan's other way to build: the reset lays a whole layer (one
+# block per slot, side by side) on a pad on the table, and the robot places
+# all of it on the tower at once with a side grip across the blocks. Twelve
+# placements per tower instead of 36.
+
+# Layer-mode episode sets: clean tower, drifted tower, perturbed start. D and
+# E (a misplaced top block, a missed grasp) are block-mode only for now.
+LAYER_EPISODE_SETS = ("A", "B", "C")
+
+
+@dataclass(frozen=True)
+class PadConfig:
+    """Where the reset lays the next layer, ready to pick, in world XY.
+
+    The layer points the way the tower's next layer does, so the carry is
+    nearly a translation. Its centre and yaw are jittered per seed so the
+    policy has to find it in the image rather than memorise one spot."""
+
+    center_xy_m: tuple[float, float] = (0.30, -0.15)
+    # Gap between neighbouring blocks on the pad. Nothing goes between them
+    # (the side grip closes across all of them), so it is a seam, not room.
+    seam_m: float = 0.001
+    xy_jitter_m: float = 0.015
+    yaw_jitter_deg: float = 10.0
+
+
+@dataclass(frozen=True)
+class LayerSpec:
+    """Everything a place-the-layer episode needs before the robot moves."""
+
+    seed: int
+    episode_set: str
+    # Whole layers already on the tower; the next layer is this index.
+    placed_layers: int
+    placed_count: int
+    # Tower blocks by prop name, in placement order.
+    tower_poses: Mapping[str, Pose]
+    # The layer on the pad and where each of its blocks goes, both keyed by
+    # prop name and listed by slot (0 = negative side of the layer).
+    pad_poses: Mapping[str, Pose]
+    layer_targets: Mapping[str, Pose]
+    # Blocks neither in the tower nor on the pad, lying on the table.
+    loose_poses: Mapping[str, Pose] = field(default_factory=dict)
+    perturbed_start: bool = False
+    # Block mode's set D fields; never used in layer mode, read by the reset.
+    misplaced_block: str | None = None
+    misplaced_pose: Pose | None = None
+
+    @property
+    def middle_block(self) -> str:
+        """The block the grip centres on and the carry aims with."""
+        names = list(self.pad_poses)
+        return names[len(names) // 2]
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "seed": self.seed,
+            "episode_set": self.episode_set,
+            "build": "layer",
+            "placed_layers": self.placed_layers,
+            "placed_count": self.placed_count,
+            "pad_blocks": list(self.pad_poses),
+            "pad_poses": {n: _pose_json(p) for n, p in self.pad_poses.items()},
+            "layer_targets": {n: _pose_json(p) for n, p in self.layer_targets.items()},
+            "perturbed_start": self.perturbed_start,
+            "loose_blocks": len(self.loose_poses),
+        }
+
+
+def next_layer_targets(
+    config: TowerConfig, seed: int, layer: int, drifted: bool
+) -> list[Pose]:
+    """Slot poses for a whole new layer, by slot index. A new layer centres on
+    the layer below's drift, as `next_slot_target` does for its first block."""
+    if not 0 <= layer < config.layers:
+        raise ValueError(f"layer {layer} outside the tower")
+    offsets = layer_offsets(config, seed, drifted)
+    (ox, oy), oyaw = ((0.0, 0.0), 0.0) if layer == 0 else offsets[layer - 1]
+    order = layer_slot_order(config, layer)
+    start = layer * config.slots_per_layer
+    return [
+        nominal_slot_pose(
+            config, SlotRef(start + order.index(slot), layer, slot), (ox, oy), oyaw
+        )
+        for slot in range(config.slots_per_layer)
+    ]
+
+
+def pad_layer_poses(
+    config: TowerConfig, pad: PadConfig, seed: int, layer: int, key: str = "pad"
+) -> list[Pose]:
+    """The layer as the reset lays it on the pad, by slot index: the tower's
+    layer `layer` (undrifted) moved to the pad centre, turned by the seed's
+    yaw jitter, with the tower's seam jitter per block. `config` is the
+    layer-mode tower (`layer_mode_tower`), so the blocks are `seam_m` apart."""
+    rng = _rng(key, seed)
+    nominal = next_layer_targets(config, seed, layer, drifted=False)
+    centre_x = pad.center_xy_m[0] + rng.uniform(-pad.xy_jitter_m, pad.xy_jitter_m)
+    centre_y = pad.center_xy_m[1] + rng.uniform(-pad.xy_jitter_m, pad.xy_jitter_m)
+    turn = rng.uniform(-pad.yaw_jitter_deg, pad.yaw_jitter_deg)
+    z = config.support_z_m + config.block_thickness_m / 2.0
+    drift = config.drift
+    poses: list[Pose] = []
+    for target in nominal:
+        dx, dy = _rotate_xy(
+            target.position[0] - config.base_xy_m[0],
+            target.position[1] - config.base_xy_m[1],
+            turn,
+        )
+        nominal_pose = Pose(
+            (centre_x + dx, centre_y + dy, z), wrap_deg(target.yaw_deg + turn, 180.0)
+        )
+        jittered = Pose(
+            (
+                nominal_pose.position[0] + rng.gauss(0.0, drift.seam_jitter_xy_m),
+                nominal_pose.position[1] + rng.gauss(0.0, drift.seam_jitter_xy_m),
+                z,
+            ),
+            wrap_deg(nominal_pose.yaw_deg + rng.gauss(0.0, drift.seam_jitter_yaw_deg), 180.0),
+        )
+        if any(blocks_overlap(config, jittered, other, BLOCK_CLEARANCE_M) for other in poses):
+            jittered = nominal_pose
+        poses.append(jittered)
+    return poses
+
+
+def layer_mode_tower(config: TowerConfig, pad: PadConfig) -> TowerConfig:
+    """The tower as layer mode builds it. A side grip squeezes the layer
+    together, so placed layers sit `pad.seam_m` apart, not the block-mode gap
+    that leaves room for end-grip pads between neighbours."""
+    return replace(config, slot_gap_m=pad.seam_m)
+
+
+def _check_pad_clear_of_tower(config: TowerConfig, pad: PadConfig) -> None:
+    reach = 2.0 * tower_footprint_radius(config) + math.sqrt(2.0) * pad.xy_jitter_m
+    if math.dist(pad.center_xy_m, config.base_xy_m) < reach:
+        raise ValueError(
+            f"layer pad at {pad.center_xy_m} is within {reach:.3f} m of the tower; move it"
+        )
+
+
+def _pad_names_by_slot(
+    config: TowerConfig, layer: int, names_in_placement_order: Sequence[str]
+) -> list[str]:
+    """The pad's prop names by slot index, from the next layer's names in
+    placement order (so slot s gets the prop block mode would place there)."""
+    order = layer_slot_order(config, layer)
+    by_slot = [""] * config.slots_per_layer
+    for position, slot in enumerate(order):
+        by_slot[slot] = names_in_placement_order[position]
+    return by_slot
+
+
+def sample_layer_episode_set(seed: int) -> str:
+    weights = {name: EPISODE_SET_WEIGHTS[name] for name in LAYER_EPISODE_SETS}
+    return sample_episode_set(seed, weights)
+
+
+def build_layer_spec(
+    seed: int,
+    tower: TowerConfig,
+    pad: PadConfig = PadConfig(),
+    scatter: ScatterConfig = ScatterConfig(),
+    *,
+    episode_set: str | None = None,
+    placed_layers: int | None = None,
+) -> LayerSpec:
+    """Decide one place-the-layer episode from its seed.
+
+    Tower height is uniform over 0..layers-1 whole layers. The next layer's
+    blocks lie on the pad; every other block not in the tower is scattered
+    on the table, clear of the pad, as distractors. The tower is the
+    layer-mode tower (`layer_mode_tower`)."""
+    tower = layer_mode_tower(tower, pad)
+    chosen = episode_set or sample_layer_episode_set(seed)
+    if chosen not in LAYER_EPISODE_SETS:
+        raise ValueError(
+            f"layer mode runs sets {LAYER_EPISODE_SETS} (F with --chain); got {chosen!r}"
+        )
+    _check_pad_clear_of_tower(tower, pad)
+    if placed_layers is None:
+        placed_layers = _rng("tower-layers", seed).randint(0, tower.layers - 1)
+    if not 0 <= placed_layers < tower.layers:
+        raise ValueError(f"placed_layers {placed_layers} leaves no layer to place")
+    n = tower.slots_per_layer
+    placed_count = placed_layers * n
+    drifted = chosen == "B"
+    names = prop_order(tower, seed)
+    pad_names = _pad_names_by_slot(tower, placed_layers, names[placed_count:placed_count + n])
+    pad_poses = pad_layer_poses(tower, pad, seed, placed_layers)
+    targets = next_layer_targets(tower, seed, placed_layers, drifted)
+    loose_names = names[placed_count + n:]
+    loose = (
+        sample_loose_poses(
+            tower, scatter, seed, loose_names, keep_clear=pad_poses, require_pick=False
+        )
+        if loose_names else {}
+    )
+    return LayerSpec(
+        seed=int(seed),
+        episode_set=chosen,
+        placed_layers=placed_layers,
+        placed_count=placed_count,
+        tower_poses=tower_poses(tower, seed, placed_count, drifted, names),
+        pad_poses=dict(zip(pad_names, pad_poses)),
+        layer_targets=dict(zip(pad_names, targets)),
+        loose_poses=loose,
+        perturbed_start=chosen == "C",
+    )
+
+
+def chain_layer_spec(
+    seed: int,
+    tower: TowerConfig,
+    pad: PadConfig,
+    tower_names: Sequence[str],
+    loose: Mapping[str, Pose],
+) -> LayerSpec | None:
+    """The next step of a chained layer build (set F): the tower built so far
+    (prop names in placement order) stays as it stands, the next layer is laid
+    on the pad from the loose blocks (in prop-name order), and the other loose
+    blocks stay where they lie. None if fewer than a layer's worth of loose
+    blocks are left, or one of the rest lies on the pad."""
+    tower = layer_mode_tower(tower, pad)
+    n = tower.slots_per_layer
+    placed_count = len(tower_names)
+    if placed_count % n:
+        raise ValueError("a chained layer build only ever has whole layers")
+    layer = placed_count // n
+    if layer >= tower.layers:
+        raise ValueError("the tower is already complete")
+    available = sorted(loose)
+    if len(available) < n:
+        return None
+    pad_poses = pad_layer_poses(tower, pad, seed, layer, key=f"pad:{layer}")
+    rest = {name: loose[name] for name in available[n:]}
+    if any(
+        blocks_overlap(tower, pose, block, 0.0) for pose in pad_poses for block in rest.values()
+    ):
+        return None
+    pad_names = _pad_names_by_slot(tower, layer, available[:n])
+    return LayerSpec(
+        seed=int(seed),
+        episode_set="F",
+        placed_layers=layer,
+        placed_count=placed_count,
+        tower_poses=tower_poses(tower, seed, placed_count, False, tower_names),
+        pad_poses=dict(zip(pad_names, pad_poses)),
+        layer_targets=dict(zip(pad_names, next_layer_targets(tower, seed, layer, False))),
+        loose_poses=rest,
     )
 
 
