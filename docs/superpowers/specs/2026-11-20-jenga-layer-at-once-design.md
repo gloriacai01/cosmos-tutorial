@@ -86,6 +86,14 @@ hold still.
   offset in the hand after the lift is used to re-aim (as `release_target`
   does for one block), from the middle block.
 
+### Layer spacing on the tower
+
+A side grip squeezes the layer together, so a layer placed as a bundle sits
+tight. Layer mode builds the tower with `slot_gap_m` = the pad seam (1 mm,
+`layer_mode_tower`), for the layers already standing and for the targets;
+block mode's 3 mm gap (room for end-grip pads) would leave each outer block
+~2 mm off its target. Corrections after the release still use the end grip.
+
 ### Episode sets in layer mode
 
 - A (clean tower), B (drifted tower), C (perturbed start). D and E are left
@@ -106,7 +114,9 @@ the placement tolerance (2 mm / 2°) and no lower block disturbed.
   scatter keeps clear of the pad.
 - `layer_episode.py` (new): `execute_place_layer` using `_Episode`'s
   `go/transit/grab/open/mark/finish`.
-- `place_episode.py`: `--build {block,layer}`, `--pad-xy`; dispatch only.
+- `place_episode.py`: `--build {block,layer}`, `--pad-xy`; dispatch, plus
+  capture start/stop and the set C start moved into shared helpers both
+  modes call. The table height is Dhriti's `--support-z-m`.
 - Tests in the kinematic fake: side-grip yaw, no wrist turn over the tower,
   the pad layer follows the tower's next layer, scatter clear of the pad,
   a chained layer build completes, and block mode unchanged.

@@ -527,12 +527,13 @@ async def reset_tower(
     """Pause, place the tower, lay the loose blocks on the table, park any
     other block, let physics settle, and check the tower stood. Returns the
     settled poses and whether the tower is stable."""
+    table = table_poses(spec)
     await world.do_command({"command": "pause"})
     try:
         unused = [
             name
             for name in tower.block_names()
-            if name not in spec.tower_poses and name not in spec.loose_poses
+            if name not in spec.tower_poses and name not in table
         ]
         if unused:
             await world.do_command({"command": "park_props", "props": unused})
@@ -550,7 +551,7 @@ async def reset_tower(
                 pose.yaw_deg,
             )
             await world.do_command(lifted.as_prop_command(name))
-        for name, pose in spec.loose_poses.items():
+        for name, pose in table.items():
             await world.do_command(pose.as_prop_command(name))
     finally:
         await world.do_command({"command": "play"})
@@ -572,6 +573,12 @@ async def reset_tower(
         ):
             unstable.append(name)
     return {"stable": not unstable, "unstable_blocks": unstable, "poses": settled}
+
+
+def table_poses(spec: Any) -> dict[str, jt.Pose]:
+    """Blocks the reset lays on the table: the loose blocks, and in layer mode
+    the layer on the pad."""
+    return {**spec.loose_poses, **getattr(spec, "pad_poses", {})}
 
 
 async def read_loose_poses(world: Any, names: Sequence[str]) -> dict[str, jt.Pose]:
@@ -662,20 +669,7 @@ async def execute_place(
 
     # Pre-capture setup: the deliberate error happens here, unrecorded.
     if spec.perturbed_start:
-        start = await motion.get_pose(names.gripper, "world")
-        rng = random.Random(f"place-start:{spec.seed}")
-        moved = PoseInFrame(
-            reference_frame=start.reference_frame,
-            pose=ViamPose(
-                x=start.pose.x + rng.gauss(0.0, noise.start_xy_stdev_m) * 1000.0,
-                y=start.pose.y + rng.gauss(0.0, noise.start_xy_stdev_m) * 1000.0,
-                z=start.pose.z + rng.gauss(0.0, noise.start_z_stdev_m) * 1000.0,
-                o_x=start.pose.o_x, o_y=start.pose.o_y, o_z=start.pose.o_z,
-                theta=start.pose.theta,
-            ),
-        )
-        with ep.timer.phase("perturbed_start"):
-            await _move(motion, names.gripper, moved, constraints=CENTER_MOVE_CONSTRAINTS)
+        await perturb_start(ep, spec.seed, noise)
     if spec.failed_grasp_aim_xy_m is not None:
         ax, ay = spec.failed_grasp_aim_xy_m
         hover_z = block.position[2] + grasp.grasp_z_offset_m + grasp.lift_height_m
@@ -688,33 +682,14 @@ async def execute_place(
             )
 
     if episode_output_dir is not None:
-        start_command: dict[str, Any] = {
-            "command": "start_episode",
-            "output_dir": episode_output_dir,
-            "episode_id": episode_id or f"{spec.seed:06d}",
-            "seed": spec.seed,
-            "task": task,
-            "arm": names.arm,
-            "gripper": names.gripper,
-            "fixed_camera": names.fixed_camera,
-            "fixed_camera_2": names.fixed_camera_2,
-            "wrist_camera": names.wrist_camera,
-            "cosmos_output_dir": cosmos_output_dir,
-            "target": {
-                "prop_name": spec.next_block,
-                "position_m": list(block.position),
-                "rotation_wxyz": list(block.orientation_wxyz),
-            },
-        }
-        if nudge is not None:
-            start_command["nudge"] = dict(nudge)
-            ep.nudged = True
         first_stage = STAGE_STRAIGHTEN if spec.misplaced_block is not None else STAGE_PICK
-        with ep.timer.phase("capture_start"):
-            await ep.begin_capture(start_command, first_stage)
+        await begin_episode_capture(
+            ep, first_stage, spec.seed, spec.next_block, block,
+            episode_output_dir=episode_output_dir, episode_id=episode_id,
+            cosmos_output_dir=cosmos_output_dir, task=task, nudge=nudge,
+        )
     result["nudge"] = dict(nudge) if nudge is not None and ep.capturing else None
 
-    capture = None
     adjustments: list[dict[str, Any]] = []
     try:
         if spec.misplaced_block is not None:
@@ -825,23 +800,95 @@ async def execute_place(
         if not success:
             result["failure"] = "disturbed" if moved else "placement"
     finally:
-        if ep.capturing:
-            stop_command: dict[str, Any] = {
-                "command": "stop_episode", "outcome": result["outcome"],
-            }
-            if upload is not None:
-                stop_command["upload"] = dict(upload)
-            with ep.timer.phase("capture_stop"):
-                capture = await _stop_episode_capture(world, stop_command)
-        timing = ep.timer.summary()
-        timing["sim_elapsed_sec"] = (
-            await sim_clock.elapsed(check_playing=False) if sim_clock.simulated else None
-        )
-        result["phases"] = list(ep.phases)
-        result["stages"] = list(ep.stages)
-        result["capture"] = capture
-        result["timing"] = timing
+        await end_episode_capture(ep, result, sim_clock, upload)
     return result
+
+
+async def perturb_start(ep: _Episode, seed: int, noise: NoiseConfig) -> None:
+    """Set C's deliberate start error, before capture: move the TCP off home
+    by the noise config's spread. Shared by block and layer mode."""
+    start = await ep.motion.get_pose(ep.names.gripper, "world")
+    rng = random.Random(f"place-start:{seed}")
+    moved = PoseInFrame(
+        reference_frame=start.reference_frame,
+        pose=ViamPose(
+            x=start.pose.x + rng.gauss(0.0, noise.start_xy_stdev_m) * 1000.0,
+            y=start.pose.y + rng.gauss(0.0, noise.start_xy_stdev_m) * 1000.0,
+            z=start.pose.z + rng.gauss(0.0, noise.start_z_stdev_m) * 1000.0,
+            o_x=start.pose.o_x, o_y=start.pose.o_y, o_z=start.pose.o_z,
+            theta=start.pose.theta,
+        ),
+    )
+    with ep.timer.phase("perturbed_start"):
+        await _move(ep.motion, ep.names.gripper, moved, constraints=CENTER_MOVE_CONSTRAINTS)
+
+
+async def begin_episode_capture(
+    ep: _Episode,
+    first_stage: str,
+    seed: int,
+    target_prop: str,
+    target_pose: jt.Pose,
+    *,
+    episode_output_dir: str,
+    episode_id: str | None,
+    cosmos_output_dir: str | None,
+    task: str,
+    nudge: Mapping[str, Any] | None,
+) -> None:
+    """Open the episode's capture with `first_stage` at frame 0. Shared by
+    block and layer mode."""
+    start_command: dict[str, Any] = {
+        "command": "start_episode",
+        "output_dir": episode_output_dir,
+        "episode_id": episode_id or f"{seed:06d}",
+        "seed": seed,
+        "task": task,
+        "arm": ep.names.arm,
+        "gripper": ep.names.gripper,
+        "fixed_camera": ep.names.fixed_camera,
+        "fixed_camera_2": ep.names.fixed_camera_2,
+        "wrist_camera": ep.names.wrist_camera,
+        "cosmos_output_dir": cosmos_output_dir,
+        "target": {
+            "prop_name": target_prop,
+            "position_m": list(target_pose.position),
+            "rotation_wxyz": list(target_pose.orientation_wxyz),
+        },
+    }
+    if nudge is not None:
+        start_command["nudge"] = dict(nudge)
+        ep.nudged = True
+    with ep.timer.phase("capture_start"):
+        await ep.begin_capture(start_command, first_stage)
+
+
+async def end_episode_capture(
+    ep: _Episode,
+    result: dict[str, Any],
+    sim_clock: Any,
+    upload: Mapping[str, Any] | None,
+) -> None:
+    """Close any open capture with the result's outcome and fill in the
+    result's phases, stages, capture and timing. Shared by block and layer
+    mode; runs even when the episode raised."""
+    capture = None
+    if ep.capturing:
+        stop_command: dict[str, Any] = {
+            "command": "stop_episode", "outcome": result["outcome"],
+        }
+        if upload is not None:
+            stop_command["upload"] = dict(upload)
+        with ep.timer.phase("capture_stop"):
+            capture = await _stop_episode_capture(ep.world, stop_command)
+    timing = ep.timer.summary()
+    timing["sim_elapsed_sec"] = (
+        await sim_clock.elapsed(check_playing=False) if sim_clock.simulated else None
+    )
+    result["phases"] = list(ep.phases)
+    result["stages"] = list(ep.stages)
+    result["capture"] = capture
+    result["timing"] = timing
 
 
 async def close_open_episode(world: Any) -> None:
@@ -866,13 +913,14 @@ async def run_episode_safely(
     tower: jt.TowerConfig,
     *,
     timeout_sec: float = 0.0,
+    execute: Any = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
     """`execute_place`, but an exception or a timeout ends only this episode:
     it is recorded as outcome "error" and the batch carries on, as
     batch_episodes.py does for picks."""
     try:
-        run = execute_place(world, gripper, motion, arm, spec, tower, **kwargs)
+        run = (execute or execute_place)(world, gripper, motion, arm, spec, tower, **kwargs)
         if timeout_sec > 0:
             return await asyncio.wait_for(run, timeout=timeout_sec)
         return await run
@@ -915,7 +963,19 @@ def _parser() -> argparse.ArgumentParser:
         "--set", dest="episode_set", choices=jt.EPISODE_SETS,
         help="force one episode set; default samples A-E by the plan's weights",
     )
-    parser.add_argument("--placed", type=int, help="force the starting tower size")
+    parser.add_argument(
+        "--build", choices=("block", "layer"), default="block",
+        help="block: place one block per episode; layer: the reset lays the next "
+        "layer on the pad and the episode places all of it with a side grip",
+    )
+    parser.add_argument(
+        "--placed", type=int,
+        help="force the starting tower size: blocks (--build block) or whole layers (--build layer)",
+    )
+    parser.add_argument(
+        "--pad-xy", type=_xy, default=jt.PadConfig.center_xy_m,
+        help="--build layer: where the reset lays the next layer, X,Y in the arm base frame (m)",
+    )
     parser.add_argument(
         "--scatter-min-xy", type=_xy, default=jt.ScatterConfig.region_min_xy_m,
         help="corner X,Y of the table region the loose blocks lie in, in the arm base frame (m)",
@@ -976,7 +1036,10 @@ def _parser() -> argparse.ArgumentParser:
         help="extra tag for uploaded episodes; may be repeated",
     )
     parser.add_argument("--app-url", help="Viam app host the machine uploads to (default: app.viam.com)")
-    parser.add_argument("--task", default=DEFAULT_PROMPT)
+    parser.add_argument(
+        "--task", default=None,
+        help=f"episode prompt; default {DEFAULT_PROMPT!r}, or for --build layer the layer prompt",
+    )
     parser.add_argument("--world", default=MachineNames.world)
     parser.add_argument("--arm", default=MachineNames.arm)
     parser.add_argument("--gripper", default=MachineNames.gripper)
@@ -1039,6 +1102,19 @@ async def _run(args: argparse.Namespace) -> int:
             scatter = jt.ScatterConfig(
                 region_min_xy_m=(min(xs), min(ys)), region_max_xy_m=(max(xs), max(ys))
             )
+            layer_mode = args.build == "layer"
+            if layer_mode:
+                if __package__:
+                    from . import layer_episode as le
+                else:
+                    import layer_episode as le
+                pad = jt.PadConfig(
+                    center_xy_m=await arm_to_world_xy(machine, names.arm, *args.pad_xy)
+                )
+                tower = jt.layer_mode_tower(tower, pad)
+                execute, task = le.execute_place_layer, args.task or le.LAYER_PROMPT
+            else:
+                execute, task = execute_place, args.task or DEFAULT_PROMPT
             world = Generic.from_robot(machine, names.world)
             gripper = Gripper.from_robot(machine, names.gripper)
             motion = MotionClient.from_robot(machine, names.motion)
@@ -1062,11 +1138,11 @@ async def _run(args: argparse.Namespace) -> int:
                     results_file.write(line + "\n")
                     results_file.flush()
 
-            async def run(spec: jt.EpisodeSpec, episode_id: str, reset: bool) -> dict[str, Any]:
+            async def run(spec: Any, episode_id: str, reset: bool) -> dict[str, Any]:
                 result = await run_episode_safely(
                     world, gripper, motion, arm, spec, tower,
-                    timeout_sec=args.episode_timeout_sec,
-                    names=names, grasp=grasp, task=args.task, reset=reset,
+                    timeout_sec=args.episode_timeout_sec, execute=execute,
+                    names=names, grasp=grasp, task=task, reset=reset,
                     home_joint_degrees=args.home_joints,
                     episode_output_dir=episode_dir,
                     cosmos_output_dir=(
@@ -1081,11 +1157,15 @@ async def _run(args: argparse.Namespace) -> int:
                     upload=upload,
                 )
                 result["episode_id"] = episode_id
+                result["build"] = args.build
                 result["embodiment"] = {"arm_model": ARM_MODEL, "gripper_model": GRIPPER_MODEL}
                 emit(result)
                 return result
 
             for seed in range(args.seed, args.seed + args.count):
+                if layer_mode:
+                    failures += await _run_layers(args, seed, tower, pad, scatter, world, run, emit)
+                    continue
                 if not args.chain:
                     spec = jt.build_episode_spec(
                         seed, tower, scatter,
@@ -1131,6 +1211,51 @@ async def _run(args: argparse.Namespace) -> int:
     return 0 if failures == 0 else 1
 
 
+async def _run_layers(
+    args: argparse.Namespace,
+    seed: int,
+    tower: jt.TowerConfig,
+    pad: jt.PadConfig,
+    scatter: jt.ScatterConfig,
+    world: Any,
+    run: Any,
+    emit: Any,
+) -> int:
+    """One layer-mode episode, or with --chain one tower built layer by layer
+    (set F) without resets: the pad is laid afresh before each step. Returns
+    the failures to count."""
+    if not args.chain:
+        spec = jt.build_layer_spec(
+            seed, tower, pad, scatter,
+            episode_set=args.episode_set, placed_layers=args.placed,
+        )
+        result = await run(spec, f"layer{seed:06d}", True)
+        return 0 if result["outcome"] in ("success", "reset_unstable") else 1
+    spec = jt.build_layer_spec(
+        seed, tower, pad, scatter, episode_set="A", placed_layers=args.placed or 0
+    )
+    spec = replace(spec, episode_set="F")
+    built = list(spec.tower_poses)
+    reset = True
+    while True:
+        layer = spec.placed_layers
+        result = await run(spec, f"layerchain{seed:06d}-{layer:02d}", reset)
+        if result["outcome"] != "success":
+            return 0 if result["outcome"] == "reset_unstable" else 1
+        built.extend(spec.pad_poses)
+        if len(built) == tower.block_count:
+            return 0
+        loose = await read_loose_poses(world, list(spec.loose_poses))
+        next_spec = jt.chain_layer_spec(seed, tower, pad, built, loose)
+        if next_spec is None:
+            emit({
+                "episode_id": f"layerchain{seed:06d}-{layer + 1:02d}",
+                "build": "layer", "outcome": "failure", "failure": "no_layer_blocks",
+            })
+            return 1
+        spec, reset = next_spec, False
+
+
 def main() -> int:
     parser = _parser()
     args = parser.parse_args()
@@ -1146,6 +1271,8 @@ def main() -> int:
         parser.error("--count must be at least 1")
     if args.chain and args.episode_set not in (None, "F"):
         parser.error("--chain always runs set F")
+    if args.build == "layer" and args.episode_set not in (None, "F", *jt.LAYER_EPISODE_SETS):
+        parser.error(f"--build layer runs sets {', '.join(jt.LAYER_EPISODE_SETS)} (F with --chain)")
     if not 0.0 <= args.nudge_fraction <= 1.0:
         parser.error("--nudge-fraction must be between 0 and 1")
     if args.nudge_interval_sec <= 0 or args.nudge_duration_sec <= 0:
