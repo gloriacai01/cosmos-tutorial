@@ -384,9 +384,12 @@ def test_nudge_and_upload_reach_the_module():
     assert result["outcome"] == "success", result
     assert sim.start_command["nudge"] == nudge and result["nudge"] == nudge
     assert sim.stop_command["upload"] == upload
-    # Nudges run in the pick and carry only. They stop while the carry is
-    # still being recorded, before the lowering is marked, and stay off.
+    # Nudges run in the pick and carry only, off for the final grasp descent
+    # and the grab. They stop while the carry is still being recorded,
+    # before the lowering is marked, and stay off.
     assert sim.nudge_calls == [
+        (pe.STAGE_PICK, False),
+        (pe.STAGE_PICK, True),
         (pe.STAGE_PICK, False),
         (pe.STAGE_CARRY, False),
         (pe.STAGE_CARRY, True),

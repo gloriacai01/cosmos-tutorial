@@ -322,9 +322,13 @@ class _Episode:
         """Nudge only in `nudged_stages`. A nudge under way when they stop
         fades out first; wait for it so the next stage starts un-nudged
         (callers pause before marking that stage)."""
+        await self.pause_nudges(stage not in self.nudged_stages)
+
+    async def pause_nudges(self, paused: bool) -> None:
+        """Pause or resume a nudged episode's nudges; a pause waits out the
+        fade of a nudge under way."""
         if not (self.capturing and self.nudged):
             return
-        paused = stage not in self.nudged_stages
         reply = await self.world.do_command({"command": "set_nudge_paused", "paused": paused})
         remaining = float(reply.get("remaining_s") or 0.0)
         if paused and remaining > 0.0:
@@ -451,11 +455,17 @@ class _Episode:
             f"{label}-pre-grasp", x, y, grasp_z + PRE_GRASP_CLEARANCE_M, yaw,
             LINEAR_PICK_CONSTRAINTS, APPROACH_WAYPOINT_MIN_DURATION_SEC,
         )
+        # No nudges for the final descent (the last PRE_GRASP_CLEARANCE_M)
+        # and the grab: nudged there, the G2 missed the block or closed on
+        # it twisted. They resume for the lift if the stage nudges.
+        await self.pause_nudges(True)
         await self.go(
             f"{label}-grasp", x, y, grasp_z, yaw,
             LINEAR_PICK_CONSTRAINTS, FINAL_DESCENT_MIN_DURATION_SEC,
         )
         grabbed = await self.grab()
+        if self.stage is not None:
+            await self.set_nudges(self.stage)
         await self.go(
             f"{label}-lift", x, y, max(lift_z, grasp_z + self.grasp.lift_height_m), yaw,
             LINEAR_PICK_CONSTRAINTS, MIN_SUBTASK_DURATION_SEC,
